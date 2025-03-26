@@ -1,9 +1,5 @@
 package org.example;
 
-import java.util.Collections;
-import java.util.List;
-import java.util.function.Supplier;
-
 import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.common.settings.ClusterSettings;
@@ -14,6 +10,10 @@ import org.elasticsearch.plugins.ActionPlugin;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.rest.RestController;
 import org.elasticsearch.rest.RestHandler;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.function.Supplier;
 
 public class CustomIndexPlugin extends Plugin implements ActionPlugin {
 
@@ -27,7 +27,10 @@ public class CustomIndexPlugin extends Plugin implements ActionPlugin {
             IndexNameExpressionResolver indexNameExpressionResolver,
             Supplier<DiscoveryNodes> nodesInCluster) {
 
-        // Register our custom handler
-        return Collections.singletonList(new CustomIndexRestHandler());
+        // שני REST handlers – אחד לקבלת JSON ישיר ואחד לעיבוד קבצי TXT
+        return Arrays.asList(
+                new CustomIndexRestHandler(),
+                new TxtProcessingRestHandler()
+        );
     }
 }

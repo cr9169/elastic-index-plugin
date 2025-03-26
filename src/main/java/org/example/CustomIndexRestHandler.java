@@ -25,14 +25,10 @@ public class CustomIndexRestHandler extends BaseRestHandler {
     }
 
     @Override
-    protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
-        // כאן נגדיר את שם האינדקס
+    protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
+        // יצירת IndexRequest מאת גוף הבקשה (JSON)
         IndexRequest indexRequest = new IndexRequest("target_index");
-        // שים לב: אנו מעבירים את תוכן ה-JSON שהגיע בבקשה ישירות ל-IndexRequest
         indexRequest.source(request.content(), request.getXContentType());
-
-        // החזרה של Lambda שמבצעת את האינדוקס באופן א-סינכרוני, וכותבת חזרה את התגובה
-        return channel ->
-                client.index(indexRequest, new RestToXContentListener<>(channel));
+        return channel -> client.index(indexRequest, new RestToXContentListener<>(channel));
     }
 }
