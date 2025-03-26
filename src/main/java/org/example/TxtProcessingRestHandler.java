@@ -1,6 +1,8 @@
 package org.example;
 
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
+import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
 import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.index.IndexRequest;
@@ -100,6 +102,36 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         builder.field("errorMessage", "Error processing request: " + e.getMessage());
         builder.endObject();
         channel.sendResponse(new BytesRestResponse(RestStatus.INTERNAL_SERVER_ERROR, builder));
+    }
+
+    /**
+     * פונקציה להכנת אינדקס מותאם לביצועי כתיבה גבוהים
+     */
+    private void prepareOptimizedIndex(NodeClient client) throws IOException {
+        logger.info("Preparing optimized index for bulk loading");
+
+        // בדוק אם האינדקס קיים ומחק אותו
+        try {
+            client.admin().indices().delete(new DeleteIndexRequest("target_index")).actionGet();
+            logger.info("Deleted existing target_index");
+        } catch (Exception e) {
+            // האינדקס אינו קיים - המשך
+            logger.info("No existing index to delete: " + e.getMessage());
+        }
+
+        // יצירת אינדקס מותאם לביצועי כתיבה גבוהים
+        CreateIndexRequest createRequest = new CreateIndexRequest("target_index");
+        createRequest.settings(Settings.builder()
+                .put("index.number_of_shards", 1)
+                .put("index.number_of_replicas", 0)  // ללא רפליקות בזמן האינדוקס
+                .put("index.refresh_interval", "30s")  // מניעת רענונים תכופים
+                .put("index.translog.durability", "async")  // התאוששות יעילה יותר
+                .put("index.translog.flush_threshold_size", "1gb")  // פחות פעולות flush
+                .build());
+
+        client.admin().indices().create(createRequest).actionGet();
+
+        logger.info("Created optimized index for bulk loading");
     }
 
     private ProcessingResponse processFile(String filePath, NodeClient client) {
@@ -427,6 +459,13 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             CompletableFuture<Boolean> emptyFuture = new CompletableFuture<>();
             emptyFuture.complete(true);  // אין מה לאנדקס, אז נחשיב את זה כהצלחה
             return emptyFuture;
+        }
+
+        // הכנת אינדקס מותאם לביצועי כתיבה גבוהים
+        try {
+            prepareOptimizedIndex(client);
+        } catch(Exception e) {
+            logger.warning("Could not optimize index settings: " + e.getMessage());
         }
 
         CompletableFuture<Boolean> future = new CompletableFuture<>();
