@@ -29,6 +29,7 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -37,6 +38,9 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
     // ערכים קבועים – ניתן להחליף בהגדרות חיצוניות במידת הצורך
     private static final int DEFAULT_CHUNK_SIZE_BYTES = 9 * 1024 * 1024; // 9 MB
     private static final int MAX_PARALLELISM = 4;
+    private static final int MAX_CONCURRENT_BATCHES = 3; // מספר מקסימלי של מנות במקביל
+    private static final int BATCH_SIZE = 20; // הגדלת גודל המנה ל-20 צ'אנקים לביצועים טובים יותר
+
     // הגבלת נתיבים – לדוגמה, רק קבצים מתיקיית "C:/AllowedFiles" יהיו מורשים
     private static final String ALLOWED_DIRECTORY = "C:/Users/BarGabay/big files";
     private static final Logger logger = Logger.getLogger(TxtProcessingRestHandler.class.getName());
@@ -124,9 +128,12 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         createRequest.settings(Settings.builder()
                 .put("index.number_of_shards", 1)
                 .put("index.number_of_replicas", 0)  // ללא רפליקות בזמן האינדוקס
-                .put("index.refresh_interval", "30s")  // מניעת רענונים תכופים
+                .put("index.refresh_interval", "60s")  // מניעת רענונים תכופים - הגדלה ל-60 שניות
                 .put("index.translog.durability", "async")  // התאוששות יעילה יותר
-                .put("index.translog.flush_threshold_size", "1gb")  // פחות פעולות flush
+                .put("index.translog.flush_threshold_size", "2gb")  // הגדלת סף ה-flush ל-2GB
+                .put("index.translog.sync_interval", "60s") // אינטרוול סנכרון ארוך יותר
+                .put("index.indexing.slowlog.threshold.index.warn", "60s") // אזהרות רק אם אינדוקס לוקח יותר מ-60 שניות
+                .put("index.indexing.slowlog.threshold.index.info", "30s") // מידע אם אינדוקס לוקח יותר מ-30 שניות
                 .build());
 
         client.admin().indices().create(createRequest).actionGet();
@@ -168,8 +175,15 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             long totalProcessedChars = chunks.stream().mapToLong(c -> c.getContent().length()).sum();
             logger.info("Total processed characters: " + totalProcessedChars + ", Original file size (bytes): " + fileSize);
 
-            // Bulk indexing – שליחת הצ'אנקים באינדוקס אסינכרוני ל-Elasticsearch
-            CompletableFuture<Boolean> bulkFuture = bulkIndexChunksAsync(chunks, client);
+            // הכנת אינדקס מותאם לביצועי כתיבה גבוהים
+            try {
+                prepareOptimizedIndex(client);
+            } catch(Exception e) {
+                logger.warning("Could not optimize index settings: " + e.getMessage());
+            }
+
+            // Bulk indexing משופר – שליחת הצ'אנקים במקביל ל-Elasticsearch
+            CompletableFuture<Boolean> bulkFuture = bulkIndexChunksParallel(chunks, client);
 
             // שינוי: המתנה ללא timeout - יחכה עד שהתהליך יסתיים
             boolean bulkResult = bulkFuture.get();
@@ -451,9 +465,12 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         System.gc();
     }
 
-    // שינוי: שילוב גישת עיבוד במנות עם CompletableFuture
-    private CompletableFuture<Boolean> bulkIndexChunksAsync(List<DocumentChunk> chunks, NodeClient client) {
-        logger.info("Starting bulk indexing process at " + new Date() + " for " + chunks.size() + " chunks");
+    /**
+     * מבצע אינדוקס במקביל של מנות קבצים
+     * שימוש ב-Semaphore כדי להגביל את מספר המנות במקביל
+     */
+    private CompletableFuture<Boolean> bulkIndexChunksParallel(List<DocumentChunk> chunks, NodeClient client) {
+        logger.info("Starting parallel bulk indexing process at " + new Date() + " for " + chunks.size() + " chunks");
 
         if (chunks == null || chunks.isEmpty()) {
             CompletableFuture<Boolean> emptyFuture = new CompletableFuture<>();
@@ -461,42 +478,78 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             return emptyFuture;
         }
 
-        // הכנת אינדקס מותאם לביצועי כתיבה גבוהים
-        try {
-            prepareOptimizedIndex(client);
-        } catch(Exception e) {
-            logger.warning("Could not optimize index settings: " + e.getMessage());
-        }
-
         CompletableFuture<Boolean> future = new CompletableFuture<>();
 
-        // שינוי: נשלח 10 צ'אנקים בכל bulk request (כ-90MB בכל פעם)
-        // מבוסס על בדיקות ביצועים בשטח שהראו שזה הגודל האופטימלי
-        int batchSize = 10;
-        int totalBatches = (int) Math.ceil((double) chunks.size() / batchSize);
+        // חלוקה למנות
+        List<List<DocumentChunk>> batches = new ArrayList<>();
+        for (int i = 0; i < chunks.size(); i += BATCH_SIZE) {
+            batches.add(new ArrayList<>(chunks.subList(i, Math.min(i + BATCH_SIZE, chunks.size()))));
+        }
+
+        int totalBatches = batches.size();
+        logger.info("Divided into " + totalBatches + " batches, each with up to " +
+                BATCH_SIZE + " chunks, processing up to " + MAX_CONCURRENT_BATCHES + " batches concurrently");
+
+        // מגביל את מספר המנות שרצות במקביל
+        Semaphore semaphore = new Semaphore(MAX_CONCURRENT_BATCHES);
         AtomicInteger completedBatches = new AtomicInteger(0);
+        AtomicBoolean hasFailures = new AtomicBoolean(false);
 
-        logger.info("Sending chunks in " + totalBatches + " batches, each with up to " + batchSize + " chunks (optimized for performance)");
+        // שליחת כל המנות
+        ExecutorService executor = Executors.newFixedThreadPool(MAX_CONCURRENT_BATCHES);
 
-        // שולח מנה ראשונה
-        sendNextBatch(chunks, 0, batchSize, totalBatches, completedBatches, future, client);
+        for (int i = 0; i < batches.size(); i++) {
+            final int batchIndex = i;
+            final List<DocumentChunk> batch = batches.get(i);
+
+            executor.submit(() -> {
+                try {
+                    semaphore.acquire(); // רוכש סמאפור לפני הריצה
+
+                    try {
+                        processBatch(client, batch, batchIndex, totalBatches);
+                    } catch (Exception e) {
+                        logger.severe("Error processing batch " + (batchIndex + 1) + ": " + e.getMessage());
+                        hasFailures.set(true);
+                    } finally {
+                        // לאחר שסיימנו את המנה, נשחרר את הסמאפור ונבדוק אם סיימנו
+                        semaphore.release();
+
+                        int completed = completedBatches.incrementAndGet();
+                        if (completed == totalBatches) {
+                            executor.shutdown();
+                            future.complete(!hasFailures.get());
+                            logger.info("All " + totalBatches + " batches completed at " + new Date());
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    logger.severe("Batch processing interrupted: " + e.getMessage());
+                    hasFailures.set(true);
+
+                    int completed = completedBatches.incrementAndGet();
+                    if (completed == totalBatches) {
+                        executor.shutdown();
+                        future.complete(false);
+                    }
+                }
+            });
+        }
 
         return future;
     }
 
-    private void sendNextBatch(List<DocumentChunk> chunks, int startIdx, int batchSize,
-                               int totalBatches, AtomicInteger completedBatches,
-                               CompletableFuture<Boolean> future, NodeClient client) {
+    /**
+     * מעבד מנה בודדת של צ'אנקים
+     */
+    private void processBatch(NodeClient client, List<DocumentChunk> batch, int batchIndex, int totalBatches) throws IOException {
+        int batchNumber = batchIndex + 1;
+        logger.info("Processing batch " + batchNumber + "/" + totalBatches + " with " + batch.size() + " chunks");
 
-        int endIdx = Math.min(startIdx + batchSize, chunks.size());
         BulkRequest bulkRequest = new BulkRequest();
-
-        // הוספת timeout סביר לבקשה עצמה
         bulkRequest.timeout(org.elasticsearch.core.TimeValue.timeValueMinutes(5));
 
-        // הוספת הצ'אנקים למנה הנוכחית
-        for (int i = startIdx; i < endIdx; i++) {
-            DocumentChunk chunk = chunks.get(i);
+        // הוספת כל הצ'אנקים במנה לבקשה
+        for (DocumentChunk chunk : batch) {
             Map<String, Object> source = new HashMap<>();
             source.put("content", chunk.getContent());
             source.put("fileIdentifier", chunk.getFileIdentifier());
@@ -510,51 +563,59 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             bulkRequest.add(createIndexRequest("target_index", chunk.getId(), source));
         }
 
-        int currentBatch = completedBatches.get() + 1;
-        logger.info("Sending batch " + currentBatch + "/" + totalBatches +
-                " (" + (startIdx + 1) + "-" + endIdx + " of " + chunks.size() + " chunks)");
+        long startTime = System.currentTimeMillis();
+
+        // שליחת הבקשה בצורה סינכרונית עם timeout
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicBoolean success = new AtomicBoolean(true);
 
         client.bulk(bulkRequest, new ActionListener<BulkResponse>() {
             @Override
             public void onResponse(BulkResponse bulkResponse) {
-                int completed = completedBatches.incrementAndGet();
+                try {
+                    long timeTaken = System.currentTimeMillis() - startTime;
 
-                if (bulkResponse.hasFailures()) {
-                    logger.warning("Batch " + currentBatch + " has failures: " +
-                            bulkResponse.buildFailureMessage());
-                } else {
-                    logger.info("Batch " + currentBatch + "/" + totalBatches +
-                            " completed successfully in " + bulkResponse.getTook());
-                }
-
-                // אם יש עוד מנות לשלוח
-                if (endIdx < chunks.size()) {
-                    sendNextBatch(chunks, endIdx, batchSize, totalBatches,
-                            completedBatches, future, client);
-                }
-                // אם זו המנה האחרונה שהושלמה
-                else if (completed == totalBatches) {
-                    logger.info("All " + totalBatches + " batches completed successfully at " + new Date());
-                    future.complete(true);
+                    if (bulkResponse.hasFailures()) {
+                        logger.warning("Batch " + batchNumber + "/" + totalBatches +
+                                " completed with failures in " + (timeTaken / 1000.0) + "s: " +
+                                bulkResponse.buildFailureMessage());
+                        success.set(false);
+                    } else {
+                        logger.info("Batch " + batchNumber + "/" + totalBatches +
+                                " completed successfully in " + (timeTaken / 1000.0) + "s");
+                    }
+                } finally {
+                    latch.countDown();
                 }
             }
 
             @Override
             public void onFailure(Exception e) {
-                logger.log(Level.SEVERE, "Batch " + currentBatch + " failed", e);
-                int completed = completedBatches.incrementAndGet();
-
-                // נמשיך לנסות מנות אחרות למרות כישלון
-                if (endIdx < chunks.size()) {
-                    sendNextBatch(chunks, endIdx, batchSize, totalBatches,
-                            completedBatches, future, client);
-                } else if (completed == totalBatches) {
-                    // אם כל המנות נשלחו, נחשיב את הפעולה כהצלחה חלקית
-                    logger.warning("All batches processed with some failures");
-                    future.complete(false);
+                try {
+                    long timeTaken = System.currentTimeMillis() - startTime;
+                    logger.severe("Batch " + batchNumber + "/" + totalBatches +
+                            " failed after " + (timeTaken / 1000.0) + "s: " + e.getMessage());
+                    success.set(false);
+                } finally {
+                    latch.countDown();
                 }
             }
         });
+
+        // המתן לסיום הבקשה
+        try {
+            if (!latch.await(10, TimeUnit.MINUTES)) {
+                logger.severe("Batch " + batchNumber + "/" + totalBatches + " timed out after 10 minutes");
+                throw new IOException("Batch processing timed out");
+            }
+
+            if (!success.get()) {
+                throw new IOException("Batch processing failed");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Batch processing was interrupted", e);
+        }
     }
 
     // פונקציית עזר ליצירת IndexRequest
