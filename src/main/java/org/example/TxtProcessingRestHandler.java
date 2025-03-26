@@ -38,8 +38,8 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
     // ערכים קבועים – ניתן להחליף בהגדרות חיצוניות במידת הצורך
     private static final int DEFAULT_CHUNK_SIZE_BYTES = 9 * 1024 * 1024; // 9 MB
     private static final int MAX_PARALLELISM = 4;
-    private static final int MAX_CONCURRENT_BATCHES = 3; // מספר מקסימלי של מנות במקביל
-    private static final int BATCH_SIZE = 20; // הגדלת גודל המנה ל-20 צ'אנקים לביצועים טובים יותר
+    private static final int MAX_CONCURRENT_BATCHES = 5; // הגדלה ל-5 מנות במקביל (מ-3)
+    private static final int BATCH_SIZE = 30; // הגדלה ל-30 צ'אנקים בכל מנה (מ-20)
 
     // הגבלת נתיבים – לדוגמה, רק קבצים מתיקיית "C:/AllowedFiles" יהיו מורשים
     private static final String ALLOWED_DIRECTORY = "C:/Users/BarGabay/big files";
@@ -123,22 +123,56 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             logger.info("No existing index to delete: " + e.getMessage());
         }
 
-        // יצירת אינדקס מותאם לביצועי כתיבה גבוהים
+        // יצירת אינדקס מותאם לביצועי כתיבה גבוהים עם הגדרות משופרות
         CreateIndexRequest createRequest = new CreateIndexRequest("target_index");
         createRequest.settings(Settings.builder()
                 .put("index.number_of_shards", 1)
                 .put("index.number_of_replicas", 0)  // ללא רפליקות בזמן האינדוקס
-                .put("index.refresh_interval", "60s")  // מניעת רענונים תכופים - הגדלה ל-60 שניות
+                .put("index.refresh_interval", "120s")  // הגדלה ל-120 שניות
                 .put("index.translog.durability", "async")  // התאוששות יעילה יותר
-                .put("index.translog.flush_threshold_size", "2gb")  // הגדלת סף ה-flush ל-2GB
-                .put("index.translog.sync_interval", "60s") // אינטרוול סנכרון ארוך יותר
+                .put("index.translog.flush_threshold_size", "4gb")  // הגדלת סף ה-flush ל-4GB
+                .put("index.translog.sync_interval", "120s") // הגדלה ל-120 שניות
+                .put("index.merge.scheduler.max_thread_count", 1) // הגבל threads למיזוגים
+                .put("index.merge.policy.segments_per_tier", 50)  // הגדל סגמנטים מותרים
+                .put("index.merge.policy.max_merged_segment", "5gb") // הגדל גודל סגמנט מרבי
                 .put("index.indexing.slowlog.threshold.index.warn", "60s") // אזהרות רק אם אינדוקס לוקח יותר מ-60 שניות
                 .put("index.indexing.slowlog.threshold.index.info", "30s") // מידע אם אינדוקס לוקח יותר מ-30 שניות
                 .build());
 
         client.admin().indices().create(createRequest).actionGet();
-
         logger.info("Created optimized index for bulk loading");
+
+        try {
+            // הוספת mapping אופטימלי לאינדקס
+            XContentBuilder mappingBuilder = XContentFactory.jsonBuilder()
+                    .startObject()
+                    .startObject("properties")
+                    .startObject("content")
+                    .field("type", "text")
+                    .field("index", true)
+                    .field("doc_values", false)
+                    .field("norms", false)
+                    .endObject()
+                    .startObject("fileIdentifier")
+                    .field("type", "keyword")
+                    .endObject()
+                    .startObject("fileName")
+                    .field("type", "keyword")
+                    .endObject()
+                    .startObject("sequenceNumber")
+                    .field("type", "integer")
+                    .endObject()
+                    .endObject()
+                    .endObject();
+
+            client.admin().indices().preparePutMapping("target_index")
+                    .setSource(mappingBuilder)
+                    .get();
+
+            logger.info("Created optimized mapping for target_index");
+        } catch (Exception e) {
+            logger.warning("Could not set optimized mapping: " + e.getMessage());
+        }
     }
 
     private ProcessingResponse processFile(String filePath, NodeClient client) {
@@ -167,8 +201,8 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             // ניתן לשלב קריאת גודל צ'אנק מהגדרות (אם קיימות) – כאן נעשה שימוש בערך ברירת מחדל
             int chunkSizeInBytes = DEFAULT_CHUNK_SIZE_BYTES;
 
-            // עיבוד קובץ לצ'אנקים באמצעות MemoryMappedFile ובמקביליות
-            List<DocumentChunk> chunks = chunkTextFileParallel(filePath, fileId, chunkSizeInBytes);
+            // עיבוד קובץ לצ'אנקים באמצעות שיטה משופרת
+            List<DocumentChunk> chunks = chunkTextFileOptimized(filePath, fileId, chunkSizeInBytes);
             response.setChunkCount(chunks.size());
 
             // רישום בדיקת תקינות (סיכום אורך הטקסט המעובד לעומת גודל מקור, קרי למטרת לוג)
@@ -214,6 +248,65 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         }
     }
 
+    /**
+     * קריאת קובץ משופרת באמצעות גישה רציפה לקובץ במקום memory mapping
+     */
+    private List<DocumentChunk> chunkTextFileOptimized(String filePath, String fileId, int chunkSizeInBytes) throws IOException {
+        File file = new File(filePath);
+        long fileSize = file.length();
+        int chunkCount = (int) Math.ceil((double) fileSize / chunkSizeInBytes);
+        List<DocumentChunk> chunks = new ArrayList<>(chunkCount); // הקצאה מראש
+
+        logger.info("Starting optimized file chunking for " + filePath + " into " + chunkCount + " chunks");
+        long startTime = System.currentTimeMillis();
+
+        try (RandomAccessFile raf = new RandomAccessFile(file, "r");
+             FileChannel channel = raf.getChannel()) {
+
+            ByteBuffer buffer = ByteBuffer.allocateDirect(chunkSizeInBytes);
+
+            for (int i = 0; i < chunkCount; i++) {
+                buffer.clear();
+                long startPos = (long) i * chunkSizeInBytes;
+                channel.position(startPos);
+
+                int bytesRead = channel.read(buffer);
+                buffer.flip();
+
+                byte[] bytes = new byte[bytesRead];
+                buffer.get(bytes);
+
+                String rawContent = safeUtf8Decode(bytes);
+                boolean isFirst = i == 0;
+                boolean isLast = i == chunkCount - 1;
+                String content = adjustChunkBoundaries(rawContent, !isFirst, !isLast);
+
+                DocumentChunk chunk = new DocumentChunk();
+                chunk.setId(UUID.randomUUID().toString());
+                chunk.setOriginalFilePath(filePath);
+                chunk.setFileName(file.getName());
+                chunk.setFileIdentifier(fileId);
+                chunk.setSequenceNumber(i + 1);
+                chunk.setStartPage(1);
+                chunk.setEndPage(1);
+                chunk.setTotalPages(1);
+                chunk.setContent(content);
+                chunk.setProcessedAt(new Date());
+                chunk.setFileSizeInBytes(fileSize);
+                chunk.setTotalChunks(chunkCount);
+                chunks.add(chunk);
+            }
+
+            long totalTime = System.currentTimeMillis() - startTime;
+            logger.info("Completed file chunking in " + (totalTime / 1000.0) + " seconds");
+
+            return chunks;
+        }
+    }
+
+    /**
+     * שיטה ישנה - מושארת לתאימות אחורה
+     */
     private List<DocumentChunk> chunkTextFileParallel(String filePath, String fileId, int chunkSizeInBytes)
             throws IOException, InterruptedException, ExecutionException {
         File file = new File(filePath);
@@ -466,19 +559,26 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
     }
 
     /**
-     * מבצע אינדוקס במקביל של מנות קבצים
-     * שימוש ב-Semaphore כדי להגביל את מספר המנות במקביל
+     * גרסה משופרת של bulkIndexChunksParallel עם שינויים משמעותיים לביצועים
      */
     private CompletableFuture<Boolean> bulkIndexChunksParallel(List<DocumentChunk> chunks, NodeClient client) {
         logger.info("Starting parallel bulk indexing process at " + new Date() + " for " + chunks.size() + " chunks");
 
         if (chunks == null || chunks.isEmpty()) {
             CompletableFuture<Boolean> emptyFuture = new CompletableFuture<>();
-            emptyFuture.complete(true);  // אין מה לאנדקס, אז נחשיב את זה כהצלחה
+            emptyFuture.complete(true);
             return emptyFuture;
         }
 
-        CompletableFuture<Boolean> future = new CompletableFuture<>();
+        // שימוש בפול תהליכים יעיל יותר
+        ExecutorService executor = Executors.newFixedThreadPool(MAX_CONCURRENT_BATCHES,
+                r -> {
+                    Thread t = new Thread(r);
+                    t.setName("bulk-indexer-" + t.getId());
+                    t.setPriority(Thread.MAX_PRIORITY); // סדר עדיפות גבוה
+                    return t;
+                }
+        );
 
         // חלוקה למנות
         List<List<DocumentChunk>> batches = new ArrayList<>();
@@ -486,25 +586,25 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             batches.add(new ArrayList<>(chunks.subList(i, Math.min(i + BATCH_SIZE, chunks.size()))));
         }
 
-        int totalBatches = batches.size();
-        logger.info("Divided into " + totalBatches + " batches, each with up to " +
-                BATCH_SIZE + " chunks, processing up to " + MAX_CONCURRENT_BATCHES + " batches concurrently");
-
-        // מגביל את מספר המנות שרצות במקביל
-        Semaphore semaphore = new Semaphore(MAX_CONCURRENT_BATCHES);
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
         AtomicInteger completedBatches = new AtomicInteger(0);
         AtomicBoolean hasFailures = new AtomicBoolean(false);
 
-        // שליחת כל המנות
-        ExecutorService executor = Executors.newFixedThreadPool(MAX_CONCURRENT_BATCHES);
+        // הרצה מקבילית עם סמאפור להגבלת מספר מקבילי
+        Semaphore semaphore = new Semaphore(MAX_CONCURRENT_BATCHES);
+        int totalBatches = batches.size();
 
+        logger.info("Divided into " + totalBatches + " batches, each with up to " +
+                BATCH_SIZE + " chunks, processing up to " + MAX_CONCURRENT_BATCHES + " batches concurrently");
+
+        // שליחת כל המנות
         for (int i = 0; i < batches.size(); i++) {
             final int batchIndex = i;
             final List<DocumentChunk> batch = batches.get(i);
 
-            executor.submit(() -> {
+            CompletableFuture.runAsync(() -> {
                 try {
-                    semaphore.acquire(); // רוכש סמאפור לפני הריצה
+                    semaphore.acquire();
 
                     try {
                         processBatch(client, batch, batchIndex, totalBatches);
@@ -512,11 +612,9 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                         logger.severe("Error processing batch " + (batchIndex + 1) + ": " + e.getMessage());
                         hasFailures.set(true);
                     } finally {
-                        // לאחר שסיימנו את המנה, נשחרר את הסמאפור ונבדוק אם סיימנו
                         semaphore.release();
 
-                        int completed = completedBatches.incrementAndGet();
-                        if (completed == totalBatches) {
+                        if (completedBatches.incrementAndGet() == totalBatches) {
                             executor.shutdown();
                             future.complete(!hasFailures.get());
                             logger.info("All " + totalBatches + " batches completed at " + new Date());
@@ -526,23 +624,23 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                     logger.severe("Batch processing interrupted: " + e.getMessage());
                     hasFailures.set(true);
 
-                    int completed = completedBatches.incrementAndGet();
-                    if (completed == totalBatches) {
+                    if (completedBatches.incrementAndGet() == totalBatches) {
                         executor.shutdown();
                         future.complete(false);
                     }
                 }
-            });
+            }, executor);
         }
 
         return future;
     }
 
     /**
-     * מעבד מנה בודדת של צ'אנקים
+     * מעבד מנה בודדת של צ'אנקים עם גישה משופרת ומאובטחת
      */
     private void processBatch(NodeClient client, List<DocumentChunk> batch, int batchIndex, int totalBatches) throws IOException {
         int batchNumber = batchIndex + 1;
+        long startTime = System.currentTimeMillis();
         logger.info("Processing batch " + batchNumber + "/" + totalBatches + " with " + batch.size() + " chunks");
 
         BulkRequest bulkRequest = new BulkRequest();
@@ -562,8 +660,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
             bulkRequest.add(createIndexRequest("target_index", chunk.getId(), source));
         }
-
-        long startTime = System.currentTimeMillis();
 
         // שליחת הבקשה בצורה סינכרונית עם timeout
         CountDownLatch latch = new CountDownLatch(1);
