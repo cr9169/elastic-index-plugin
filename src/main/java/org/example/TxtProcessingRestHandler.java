@@ -33,41 +33,26 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-/**
- * TxtProcessingRestHandler processes large TXT files by splitting them into chunks,
- * preparing an optimized Elasticsearch index, and bulk indexing the chunks.
- * <p>
- * This REST handler is exposed as a POST endpoint at {@code /_process_txt}.
- * It expects a JSON payload with a "path" field pointing to a TXT file.
- * The file is validated, split into chunks, and then indexed in Elasticsearch.
- */
 public class TxtProcessingRestHandler extends BaseRestHandler {
 
-    // Constants (can be replaced with external configuration)
+    // Constants (ניתן להחליף בהגדרות חיצוניות)
     private static final int DEFAULT_CHUNK_SIZE_BYTES = 9 * 1024 * 1024; // 9 MB
     private static final int MAX_PARALLELISM = 4;
     private static final int MAX_CONCURRENT_BATCHES = 5; // Increased from 3 to 5
     private static final int BATCH_SIZE = 30; // Increased from 20 to 30 chunks per batch
 
-    // Allowed directory for processing files
+    // סף לקבצים גדולים – מעל 50 MB נעשה שימוש בעיבוד מקבילי
+    private static final long LARGE_FILE_THRESHOLD = 50L * 1024 * 1024; // 50 MB
+
+    // ספריה מותרת לעיבוד קבצים
     private static final String ALLOWED_DIRECTORY = "C:/Users/BarGabay/big files";
     private static final Logger logger = Logger.getLogger(TxtProcessingRestHandler.class.getName());
 
-    /**
-     * Returns the unique name of this REST handler.
-     *
-     * @return the name "txt_processing_rest_handler".
-     */
     @Override
     public String getName() {
         return "txt_processing_rest_handler";
     }
 
-    /**
-     * Defines the REST routes handled by this handler.
-     *
-     * @return a list containing one route: POST /_process_txt.
-     */
     @Override
     public List<Route> routes() {
         return Collections.singletonList(
@@ -75,38 +60,29 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         );
     }
 
-    /**
-     * Prepares the REST request by parsing the JSON payload for the file path,
-     * validating the file's location, processing the file, and sending a JSON response.
-     *
-     * @param request the incoming REST request.
-     * @param client  the NodeClient used to execute Elasticsearch operations.
-     * @return a RestChannelConsumer that sends the response.
-     * @throws IOException if an I/O error occurs during request processing.
-     */
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         try {
-            // Parse JSON content; expect a "path" field.
+            // פענוח תוכן הבקשה – מצפים לשדה "path"
             Map<String, Object> sourceAsMap = request.contentParser().map();
             String filePath = (String) sourceAsMap.get("path");
             if (filePath == null) {
                 throw new IllegalArgumentException("Missing 'path' parameter");
             }
 
-            // Validate that the requested file is within the allowed directory.
+            // אימות שהקובץ נמצא בתוך הספריה המותרת
             File requestedFile = new File(filePath);
             File allowedDir = new File(ALLOWED_DIRECTORY);
             if (!requestedFile.getCanonicalPath().startsWith(allowedDir.getCanonicalPath())) {
                 throw new SecurityException("Access denied: File is outside allowed directory");
             }
 
-            // Process the file.
+            // עיבוד הקובץ
             return channel -> {
                 try {
                     ProcessingResponse response = processFile(filePath, client);
 
-                    // Build JSON response.
+                    // בניית תגובת JSON
                     XContentBuilder builder = XContentFactory.jsonBuilder();
                     builder.startObject();
                     builder.field("success", response.isSuccess());
@@ -126,13 +102,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         }
     }
 
-    /**
-     * Sends an error response in JSON format.
-     *
-     * @param channel the REST channel to send the response.
-     * @param e       the exception that occurred.
-     * @throws IOException if an I/O error occurs while sending the response.
-     */
     private void sendErrorResponse(RestChannel channel, Exception e) throws IOException {
         XContentBuilder builder = XContentFactory.jsonBuilder();
         builder.startObject();
@@ -144,12 +113,7 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
     /**
      * Prepares an optimized Elasticsearch index for bulk loading.
-     * <p>
-     * This method attempts to delete an existing index "target_index" and then creates a new index with
-     * settings optimized for high write performance. It also attempts to set an optimized mapping.
-     *
-     * @param client the NodeClient used to perform index operations.
-     * @throws IOException if an I/O error occurs during index creation.
+     * If an index "target_index" exists, it is deleted, then a new one is created with optimized settings and mapping.
      */
     private void prepareOptimizedIndex(NodeClient client) throws IOException {
         logger.info("Preparing optimized index for bulk loading");
@@ -177,12 +141,11 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 .put("index.indexing.slowlog.threshold.index.warn", "60s") // Warning threshold
                 .put("index.indexing.slowlog.threshold.index.info", "30s") // Info threshold
                 .build());
-
         client.admin().indices().create(createRequest).actionGet();
         logger.info("Created optimized index for bulk loading");
 
+        // Apply mapping to the index.
         try {
-            // Attempt to set an optimized mapping for the index.
             XContentBuilder mappingBuilder = XContentFactory.jsonBuilder()
                     .startObject()
                     .startObject("properties")
@@ -217,10 +180,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
     /**
      * Processes a TXT file by verifying its properties, splitting it into chunks,
      * preparing an optimized index, and bulk indexing the chunks.
-     *
-     * @param filePath the path to the TXT file.
-     * @param client   the NodeClient used for Elasticsearch operations.
-     * @return a ProcessingResponse containing the outcome and metrics of the process.
      */
     private ProcessingResponse processFile(String filePath, NodeClient client) {
         ProcessingResponse response = new ProcessingResponse();
@@ -245,28 +204,28 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             response.setFileSizeInBytes(fileSize);
             String fileId = file.getName().replace(" ", "_") + "_" + fileSize + "_" + file.lastModified();
 
-            // Use default chunk size.
             int chunkSizeInBytes = DEFAULT_CHUNK_SIZE_BYTES;
-
-            // Process the file into chunks using the optimized chunking method.
-            List<DocumentChunk> chunks = chunkTextFileOptimized(filePath, fileId, chunkSizeInBytes);
+            List<DocumentChunk> chunks;
+            // בחירה בין שיטת העיבוד על סמך גודל הקובץ
+            if (fileSize > LARGE_FILE_THRESHOLD) {
+                logger.info("File size (" + fileSize + " bytes) exceeds threshold (" + LARGE_FILE_THRESHOLD + " bytes). Using parallel processing.");
+                chunks = chunkTextFileParallel(filePath, fileId, chunkSizeInBytes);
+            } else {
+                logger.info("File size (" + fileSize + " bytes) is within threshold. Using optimized sequential processing.");
+                chunks = chunkTextFileOptimized(filePath, fileId, chunkSizeInBytes);
+            }
             response.setChunkCount(chunks.size());
 
-            // Log processed characters for verification.
             long totalProcessedChars = chunks.stream().mapToLong(c -> c.getContent().length()).sum();
             logger.info("Total processed characters: " + totalProcessedChars + ", Original file size (bytes): " + fileSize);
 
-            // Prepare the optimized index.
             try {
                 prepareOptimizedIndex(client);
             } catch (Exception e) {
                 logger.warning("Could not optimize index settings: " + e.getMessage());
             }
 
-            // Bulk index the chunks concurrently.
             CompletableFuture<Boolean> bulkFuture = bulkIndexChunksParallel(chunks, client);
-
-            // Wait for bulk indexing to complete.
             boolean bulkResult = bulkFuture.get();
             if (!bulkResult) {
                 response.setErrorMessage("Bulk indexing failed");
@@ -296,12 +255,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
     /**
      * Optimized method to split a TXT file into chunks by reading it sequentially using a direct ByteBuffer.
-     *
-     * @param filePath         the path to the TXT file.
-     * @param fileId           a unique identifier for the file.
-     * @param chunkSizeInBytes the size of each chunk in bytes.
-     * @return a list of DocumentChunk objects representing the file chunks.
-     * @throws IOException if an I/O error occurs during file reading.
      */
     private List<DocumentChunk> chunkTextFileOptimized(String filePath, String fileId, int chunkSizeInBytes) throws IOException {
         File file = new File(filePath);
@@ -351,7 +304,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
             long totalTime = System.currentTimeMillis() - startTime;
             logger.info("Completed file chunking in " + (totalTime / 1000.0) + " seconds");
-
             return chunks;
         }
     }
@@ -359,14 +311,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
     /**
      * Legacy method for splitting a TXT file into chunks using memory mapping.
      * Retained for backward compatibility.
-     *
-     * @param filePath         the path to the TXT file.
-     * @param fileId           a unique identifier for the file.
-     * @param chunkSizeInBytes the size of each chunk in bytes.
-     * @return a list of DocumentChunk objects representing the file chunks.
-     * @throws IOException          if an I/O error occurs during file reading.
-     * @throws InterruptedException if the thread is interrupted.
-     * @throws ExecutionException   if an error occurs during asynchronous processing.
      */
     private List<DocumentChunk> chunkTextFileParallel(String filePath, String fileId, int chunkSizeInBytes)
             throws IOException, InterruptedException, ExecutionException {
@@ -455,7 +399,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             }
             chunks.sort(Comparator.comparingInt(DocumentChunk::getSequenceNumber));
             return chunks;
-
         } finally {
             if (executor != null && !executor.isTerminated()) {
                 try {
@@ -486,9 +429,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
     /**
      * Safely decodes a byte array into a UTF-8 string, ensuring the last byte does not split a multi-byte character.
-     *
-     * @param bytes the byte array to decode.
-     * @return the decoded UTF-8 string.
      */
     private String safeUtf8Decode(byte[] bytes) {
         int len = bytes.length;
@@ -502,17 +442,11 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
     /**
      * Adjusts the boundaries of a chunk's content by finding appropriate break points,
      * ensuring that chunks do not cut off in the middle of words or sentences.
-     *
-     * @param content     the raw chunk content.
-     * @param adjustStart if true, adjust the start boundary.
-     * @param adjustEnd   if true, adjust the end boundary.
-     * @return the adjusted content.
      */
     private String adjustChunkBoundaries(String content, boolean adjustStart, boolean adjustEnd) {
         if (content == null || content.isEmpty()) {
             return "";
         }
-
         int startIdx = 0;
         int endIdx = content.length();
 
@@ -522,25 +456,19 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         if (adjustEnd) {
             endIdx = findLastBreakPoint(content);
         }
-
         if (startIdx >= endIdx || startIdx >= content.length()) {
             return content;
         }
-
         return content.substring(startIdx, endIdx);
     }
 
     /**
      * Finds the first break point in the text within the first 500 characters.
-     *
-     * @param text the text to search.
-     * @return the index after the first break point, or 0 if none is found.
      */
     private int findFirstBreakPoint(String text) {
         if (text == null || text.isEmpty()) {
             return 0;
         }
-
         int limit = Math.min(text.length(), 500);
         for (int i = 0; i < limit; i++) {
             if (text.charAt(i) == '\n' || Character.isWhitespace(text.charAt(i))) {
@@ -552,15 +480,11 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
     /**
      * Finds the last break point in the text within the last 500 characters.
-     *
-     * @param text the text to search.
-     * @return the index after the last break point, or the text length if none is found.
      */
     private int findLastBreakPoint(String text) {
         if (text == null || text.isEmpty()) {
             return 0;
         }
-
         int start = Math.max(0, text.length() - 500);
         for (int i = text.length() - 1; i >= start; i--) {
             if (text.charAt(i) == '\n' ||
@@ -574,14 +498,11 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
     /**
      * Cleans up a MappedByteBuffer using reflection or alternative methods to release its resources.
-     *
-     * @param buffer the MappedByteBuffer to clean.
      */
     private void cleanMappedByteBuffer(final MappedByteBuffer buffer) {
         if (buffer == null) {
             return;
         }
-
         try {
             try {
                 Method cleanerMethod = buffer.getClass().getMethod("cleaner");
@@ -593,9 +514,7 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                     cleanMethod.invoke(cleaner);
                     return;
                 }
-            } catch (Exception ignored) {
-            }
-
+            } catch (Exception ignored) { }
             try {
                 Method getCleanerMethod = buffer.getClass().getDeclaredMethod("cleaner");
                 getCleanerMethod.setAccessible(true);
@@ -604,9 +523,7 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 cleanMethod.setAccessible(true);
                 cleanMethod.invoke(cleaner);
                 return;
-            } catch (Exception ignored) {
-            }
-
+            } catch (Exception ignored) { }
             try {
                 Field unsafeField = Class.forName("sun.misc.Unsafe").getDeclaredField("theUnsafe");
                 unsafeField.setAccessible(true);
@@ -614,61 +531,46 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 Method invokeCleaner = unsafe.getClass().getMethod("invokeCleaner", ByteBuffer.class);
                 invokeCleaner.invoke(unsafe, buffer);
                 return;
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) { }
         } catch (Exception e) {
             logger.log(Level.WARNING, "Failed to clean direct buffer", e);
         }
-
         buffer.clear();
         System.gc();
     }
 
     /**
      * Enhanced version of bulkIndexChunksParallel for improved performance.
-     * <p>
-     * This method divides document chunks into batches and indexes them in parallel using an ExecutorService.
-     *
-     * @param chunks the list of document chunks to index.
-     * @param client the NodeClient used for bulk indexing.
-     * @return a CompletableFuture that resolves to true if bulk indexing succeeds, or false otherwise.
+     * Divides document chunks into batches and indexes them in parallel.
      */
     private CompletableFuture<Boolean> bulkIndexChunksParallel(List<DocumentChunk> chunks, NodeClient client) {
         logger.info("Starting parallel bulk indexing process at " + new Date() + " for " + chunks.size() + " chunks");
-
         if (chunks == null || chunks.isEmpty()) {
             CompletableFuture<Boolean> emptyFuture = new CompletableFuture<>();
             emptyFuture.complete(true);
             return emptyFuture;
         }
-
-        ExecutorService executor = Executors.newFixedThreadPool(MAX_CONCURRENT_BATCHES,
-                r -> {
-                    Thread t = new Thread(r);
-                    t.setName("bulk-indexer-" + t.getId());
-                    t.setPriority(Thread.MAX_PRIORITY);
-                    return t;
-                }
-        );
-
+        ExecutorService executor = Executors.newFixedThreadPool(MAX_CONCURRENT_BATCHES, r -> {
+            Thread t = new Thread(r);
+            t.setName("bulk-indexer-" + t.getId());
+            t.setPriority(Thread.MAX_PRIORITY);
+            return t;
+        });
         List<List<DocumentChunk>> batches = new ArrayList<>();
         for (int i = 0; i < chunks.size(); i += BATCH_SIZE) {
             batches.add(new ArrayList<>(chunks.subList(i, Math.min(i + BATCH_SIZE, chunks.size()))));
         }
-
         CompletableFuture<Boolean> future = new CompletableFuture<>();
         AtomicInteger completedBatches = new AtomicInteger(0);
         AtomicBoolean hasFailures = new AtomicBoolean(false);
         Semaphore semaphore = new Semaphore(MAX_CONCURRENT_BATCHES);
         int totalBatches = batches.size();
-
         logger.info("Divided into " + totalBatches + " batches, each with up to " +
                 BATCH_SIZE + " chunks, processing up to " + MAX_CONCURRENT_BATCHES + " batches concurrently");
 
         for (int i = 0; i < batches.size(); i++) {
             final int batchIndex = i;
             final List<DocumentChunk> batch = batches.get(i);
-
             CompletableFuture.runAsync(() -> {
                 try {
                     semaphore.acquire();
@@ -695,18 +597,11 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 }
             }, executor);
         }
-
         return future;
     }
 
     /**
      * Processes a single batch of document chunks by creating a BulkRequest and sending it to Elasticsearch.
-     *
-     * @param client       the NodeClient used for bulk indexing.
-     * @param batch        the list of document chunks in the current batch.
-     * @param batchIndex   the index of the current batch.
-     * @param totalBatches the total number of batches.
-     * @throws IOException if an I/O error occurs during bulk indexing.
      */
     private void processBatch(NodeClient client, List<DocumentChunk> batch, int batchIndex, int totalBatches) throws IOException {
         int batchNumber = batchIndex + 1;
@@ -726,7 +621,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             source.put("totalChunks", chunk.getTotalChunks());
             source.put("processedAt", chunk.getProcessedAt());
             source.put("fileSizeInBytes", chunk.getFileSizeInBytes());
-
             bulkRequest.add(createIndexRequest("target_index", chunk.getId(), source));
         }
 
@@ -781,18 +675,15 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
     /**
      * Helper method to create an IndexRequest with the specified index name, document ID, and source map.
-     *
-     * @param indexName the name of the index.
-     * @param id        the document ID.
-     * @param source    the source map containing document fields.
-     * @return an IndexRequest ready for indexing.
      */
     private IndexRequest createIndexRequest(String indexName, String id, Map<String, Object> source) {
         return new IndexRequest(indexName).id(id).source(source, XContentType.JSON);
     }
 
+    // Inner classes for the response and chunk models.
+
     /**
-     * ProcessingResponse is a model representing the outcome of processing a TXT file.
+     * ProcessingResponse represents the outcome of processing a TXT file.
      */
     public static class ProcessingResponse {
         private String id;
@@ -831,38 +722,27 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
     public static class DocumentChunk {
         // A unique identifier for this chunk, typically generated as a UUID.
         private String id;
-
         // An identifier derived from the original file's properties (e.g., name, size, modification time)
         // to uniquely relate the chunk back to the source file.
         private String fileIdentifier;
-
         // The complete file path of the original file from which this chunk was extracted.
         private String originalFilePath;
-
         // The name of the file (without path) from which this chunk originates.
         private String fileName;
-
         // The sequential number of this chunk in the overall file processing.
         private int sequenceNumber;
-
         // The total number of chunks into which the file was divided.
         private int totalChunks;
-
         // The starting page number associated with this chunk (useful if the file is viewed in pages).
         private int startPage;
-
         // The ending page number associated with this chunk.
         private int endPage;
-
         // The total number of pages in the original file, if applicable.
         private int totalPages;
-
         // The actual text content contained in this chunk.
         private String content;
-
         // The date and time when this chunk was processed.
         private Date processedAt;
-
         // The size of the original file in bytes.
         private long fileSizeInBytes;
 
