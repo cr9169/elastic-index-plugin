@@ -32,6 +32,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;
+import org.elasticsearch.cluster.health.ClusterHealthStatus;
+import org.elasticsearch.core.TimeValue;
 
 public class TxtProcessingRestHandler extends BaseRestHandler {
 
@@ -231,6 +234,23 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 response.setErrorMessage("Bulk indexing failed");
                 return response;
             }
+
+            // -------------------------------
+            // בדיקת בריאות הקלאסטר - וודא שהאינדקס 'target_index' במצב green
+            ClusterHealthResponse healthResponse = client.admin()
+                    .cluster()
+                    .prepareHealth("target_index")
+                    .setWaitForStatus(ClusterHealthStatus.GREEN)
+                    .setTimeout(TimeValue.timeValueSeconds(30))
+                    .execute()
+                    .actionGet();
+
+            if (healthResponse.getStatus() == ClusterHealthStatus.GREEN) {
+                logger.info("Cluster health is green. Index is ready.");
+            } else {
+                logger.warning("Cluster health check returned non-green status: " + healthResponse.getStatus());
+            }
+            // -------------------------------
 
             response.setSuccess(true);
             long overallTime = System.currentTimeMillis() - overallStart;
