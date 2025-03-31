@@ -85,7 +85,14 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             // עיבוד הקובץ
             return channel -> {
                 try {
-                    ProcessingResponse response = processFile(filePath, client);
+                    String uri = request.getHttpRequest().uri();
+                    ProcessingResponse response;
+                    if (uri.contains("_process_txt_optimized")) {
+                        logger.info("Using always-optimized sequential processing for file: " + filePath);
+                        response = processFileOptimized(filePath, client);
+                    } else {
+                        response = processFile(filePath, client);
+                    }
 
                     // בניית תגובת JSON
                     XContentBuilder builder = XContentFactory.jsonBuilder();
