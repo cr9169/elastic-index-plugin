@@ -58,8 +58,10 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
     @Override
     public List<Route> routes() {
-        return Collections.singletonList(
-                new Route(RestRequest.Method.POST, "/_process_txt")
+        // שני נתיבים – הנתיב הרגיל ובנוסף נתיב שמכריח שימוש תמידי בעיבוד סדרתי
+        return Arrays.asList(
+                new Route(RestRequest.Method.POST, "/_process_txt"),
+                new Route(RestRequest.Method.POST, "/_process_txt_optimized")
         );
     }
 
@@ -209,7 +211,7 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
             int chunkSizeInBytes = DEFAULT_CHUNK_SIZE_BYTES;
             List<DocumentChunk> chunks;
-            // בחירה בין שיטת העיבוד על סמך גודל הקובץ
+            // בחירה בין שיטת עיבוד על סמך גודל הקובץ
             if (fileSize > LARGE_FILE_THRESHOLD) {
                 logger.info("File size (" + fileSize + " bytes) exceeds threshold (" + LARGE_FILE_THRESHOLD + " bytes). Using parallel processing.");
                 chunks = chunkTextFileParallel(filePath, fileId, chunkSizeInBytes);
@@ -236,20 +238,152 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             }
 
             // -------------------------------
-            // בדיקת בריאות הקלאסטר - וודא שהאינדקס 'target_index' במצב green
-            ClusterHealthResponse healthResponse = client.admin()
-                    .cluster()
-                    .prepareHealth("target_index")
-                    .setWaitForStatus(ClusterHealthStatus.GREEN)
-                    .setTimeout(TimeValue.timeValueSeconds(30))
-                    .execute()
-                    .actionGet();
+            // שלב: ודא שכל המסמכים כבר זמינים לחיפוש
+            long endOfIndexingMillis = System.currentTimeMillis();
 
-            if (healthResponse.getStatus() == ClusterHealthStatus.GREEN) {
-                logger.info("Cluster health is green. Index is ready.");
-            } else {
-                logger.warning("Cluster health check returned non-green status: " + healthResponse.getStatus());
+            // 1. Refresh לאינדקס
+            try {
+                client.admin().indices().prepareRefresh("target_index").execute().actionGet();
+                logger.info("Index refresh completed for target_index");
+            } catch (Exception e) {
+                logger.warning("Failed to refresh index: " + e.getMessage());
             }
+
+            // 2. בדיקת ספירת המסמכים (במידה וכל צ'אנק מיוצג במסמך נפרד)
+            try {
+                long docCount = client.prepareSearch("target_index")
+                        .setSize(0) // אין צורך להחזיר תוצאות, רק ספירה
+                        .get()
+                        .getHits()
+                        .getTotalHits()
+                        .value;
+                if (docCount == chunks.size()) {
+                    logger.info("All " + chunks.size() + " chunks are available for search in target_index");
+                } else {
+                    logger.warning("Expected " + chunks.size() + " documents, but found " + docCount + " in target_index");
+                }
+            } catch (Exception e) {
+                logger.warning("Unable to verify final document count: " + e.getMessage());
+            }
+
+            // 3. (אופציונלי) בדיקת בריאות הקלאסטר לסטטוס Green
+            try {
+                ClusterHealthResponse healthResponse = client.admin()
+                        .cluster()
+                        .prepareHealth("target_index")
+                        .setWaitForStatus(ClusterHealthStatus.GREEN)
+                        .setTimeout(TimeValue.timeValueSeconds(30))
+                        .execute()
+                        .actionGet();
+
+                if (healthResponse.getStatus() == ClusterHealthStatus.GREEN) {
+                    logger.info("Cluster health is green for target_index. Index is ready.");
+                } else {
+                    logger.warning("Cluster health check returned non-green status: " + healthResponse.getStatus());
+                }
+            } catch (Exception ex) {
+                logger.warning("Error checking cluster health: " + ex.getMessage());
+            }
+
+            // 4. חישוב זמן מהסיום של ה-bulk indexing ועד שהנתונים זמינים
+            long finalTimeMillis = System.currentTimeMillis() - endOfIndexingMillis;
+            logger.info("Time from end of bulk indexing to full availability: " + (finalTimeMillis / 1000.0) + "s");
+            // -------------------------------
+
+            response.setSuccess(true);
+            long overallTime = System.currentTimeMillis() - overallStart;
+            response.setProcessingTimeInSeconds(overallTime / 1000.0);
+
+            logger.info("File processing and indexing completed for " + filePath +
+                    ". Total processing time: " + (overallTime / 1000.0) + " seconds" +
+                    ". Total chunks: " + response.getChunkCount() +
+                    ". File size: " + response.getFileSizeInBytes() + " bytes");
+
+            return response;
+        } catch (InterruptedException | ExecutionException ex) {
+            logger.log(Level.SEVERE, "Error processing TXT file", ex);
+            response.setErrorMessage("Error processing TXT: " + ex.getMessage());
+            return response;
+        } catch (Exception ex) {
+            logger.log(Level.SEVERE, "Error processing TXT file", ex);
+            response.setErrorMessage("Error processing TXT: " + ex.getMessage());
+            return response;
+        }
+    }
+
+    private ProcessingResponse processFileOptimized(String filePath, NodeClient client) {
+        ProcessingResponse response = new ProcessingResponse();
+        response.setId(UUID.randomUUID().toString());
+        response.setFilePath(filePath);
+        response.setSuccess(false);
+        response.setBenchmarks(new HashMap<>());
+        long overallStart = System.currentTimeMillis();
+
+        try {
+            File file = new File(filePath);
+            if (!file.exists()) {
+                response.setErrorMessage("File does not exist: " + filePath);
+                return response;
+            }
+            if (!filePath.toLowerCase().endsWith(".txt")) {
+                response.setErrorMessage("Invalid file extension. Expected .txt");
+                return response;
+            }
+
+            long fileSize = file.length();
+            response.setFileSizeInBytes(fileSize);
+            String fileId = file.getName().replace(" ", "_") + "_" + fileSize + "_" + file.lastModified();
+
+            int chunkSizeInBytes = DEFAULT_CHUNK_SIZE_BYTES;
+            // תמיד להשתמש בשיטת העיבוד הסדרתית
+            logger.info("Using optimized sequential processing for file: " + filePath);
+            List<DocumentChunk> chunks = chunkTextFileOptimized(filePath, fileId, chunkSizeInBytes);
+            response.setChunkCount(chunks.size());
+
+            long totalProcessedChars = chunks.stream().mapToLong(c -> c.getContent().length()).sum();
+            logger.info("Total processed characters: " + totalProcessedChars + ", Original file size (bytes): " + fileSize);
+
+            try {
+                prepareOptimizedIndex(client);
+            } catch (Exception e) {
+                logger.warning("Could not optimize index settings: " + e.getMessage());
+            }
+
+            CompletableFuture<Boolean> bulkFuture = bulkIndexChunksParallel(chunks, client);
+            boolean bulkResult = bulkFuture.get();
+            if (!bulkResult) {
+                response.setErrorMessage("Bulk indexing failed");
+                return response;
+            }
+
+            // -------------------------------
+            // ודא שכל המסמכים זמינים לחיפוש
+            long endOfIndexingMillis = System.currentTimeMillis();
+            try {
+                client.admin().indices().prepareRefresh("target_index").execute().actionGet();
+                logger.info("Index refresh completed for target_index");
+            } catch (Exception e) {
+                logger.warning("Failed to refresh index: " + e.getMessage());
+            }
+
+            try {
+                long docCount = client.prepareSearch("target_index")
+                        .setSize(0)
+                        .get()
+                        .getHits()
+                        .getTotalHits()
+                        .value;
+                if (docCount == chunks.size()) {
+                    logger.info("All " + chunks.size() + " chunks are available for search in target_index");
+                } else {
+                    logger.warning("Expected " + chunks.size() + " documents, but found " + docCount + " in target_index");
+                }
+            } catch (Exception e) {
+                logger.warning("Unable to verify final document count: " + e.getMessage());
+            }
+
+            long finalTimeMillis = System.currentTimeMillis() - endOfIndexingMillis;
+            logger.info("Time from end of bulk indexing to full availability: " + (finalTimeMillis / 1000.0) + "s");
             // -------------------------------
 
             response.setSuccess(true);
