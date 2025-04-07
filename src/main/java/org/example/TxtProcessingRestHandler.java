@@ -86,11 +86,22 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             return channel -> {
                 try {
                     String uri = request.getHttpRequest().uri();
+                    logger.info("The URI is: " + uri);
+
                     ProcessingResponse response;
                     if (uri.contains("_process_txt_optimized")) {
                         logger.info("Using always-optimized sequential processing for file: " + filePath);
+                        logger.info("Using always-optimized sequential processing for file: " + filePath);
+                        logger.info("Using always-optimized sequential processing for file: " + filePath);
+                        logger.info("Using always-optimized sequential processing for file: " + filePath);
+                        logger.info("Using always-optimized sequential processing for file: " + filePath);
                         response = processFileOptimized(filePath, client);
                     } else {
+                        logger.info("Using never-optimized sequential processing for file: " + filePath);
+                        logger.info("Using never-optimized sequential processing for file: " + filePath);
+                        logger.info("Using never-optimized sequential processing for file: " + filePath);
+                        logger.info("Using never-optimized sequential processing for file: " + filePath);
+                        logger.info("Using never-optimized sequential processing for file: " + filePath);
                         response = processFile(filePath, client);
                     }
 
@@ -342,7 +353,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             String fileId = file.getName().replace(" ", "_") + "_" + fileSize + "_" + file.lastModified();
 
             int chunkSizeInBytes = DEFAULT_CHUNK_SIZE_BYTES;
-            // תמיד להשתמש בשיטת העיבוד הסדרתית
             logger.info("Using optimized sequential processing for file: " + filePath);
             List<DocumentChunk> chunks = chunkTextFileOptimized(filePath, fileId, chunkSizeInBytes);
             response.setChunkCount(chunks.size());
@@ -350,12 +360,22 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             long totalProcessedChars = chunks.stream().mapToLong(c -> c.getContent().length()).sum();
             logger.info("Total processed characters: " + totalProcessedChars + ", Original file size (bytes): " + fileSize);
 
+            // מדידת זמן קריאה ועיבוד (חלוקת הקובץ לצ'אנקים)
+            long processingEnd = System.currentTimeMillis();
+            long processingTime = processingEnd - overallStart;
+            logger.info("Reading and processing (chunking) took: " + (processingTime / 1000.0) + " seconds");
+            response.getBenchmarks().put("ReadingAndProcessingTime", processingTime / 1000.0);
+
             try {
                 prepareOptimizedIndex(client);
             } catch (Exception e) {
                 logger.warning("Could not optimize index settings: " + e.getMessage());
             }
 
+            // התחלת מדידת זמן האינדוקס הכולל (כולל bulk indexing, refresh ואימות)
+            long completeIndexingStart = System.currentTimeMillis();
+
+            // Bulk indexing של הצ'אנקים
             CompletableFuture<Boolean> bulkFuture = bulkIndexChunksParallel(chunks, client);
             boolean bulkResult = bulkFuture.get();
             if (!bulkResult) {
@@ -363,9 +383,7 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 return response;
             }
 
-            // -------------------------------
-            // ודא שכל המסמכים זמינים לחיפוש
-            long endOfIndexingMillis = System.currentTimeMillis();
+            // רענון האינדקס - מחכה עד שהמסמכים זמינים לחיפוש
             try {
                 client.admin().indices().prepareRefresh("target_index").execute().actionGet();
                 logger.info("Index refresh completed for target_index");
@@ -373,6 +391,7 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 logger.warning("Failed to refresh index: " + e.getMessage());
             }
 
+            // אימות זמינות המסמכים - בדיקת ספירת המסמכים
             try {
                 long docCount = client.prepareSearch("target_index")
                         .setSize(0)
@@ -389,9 +408,10 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 logger.warning("Unable to verify final document count: " + e.getMessage());
             }
 
-            long finalTimeMillis = System.currentTimeMillis() - endOfIndexingMillis;
-            logger.info("Time from end of bulk indexing to full availability: " + (finalTimeMillis / 1000.0) + "s");
-            // -------------------------------
+            // חישוב זמן האינדוקס הכולל - מהתחלת ה-bulk indexing ועד שהמידע מוכן לחלוטין
+            long completeIndexingTime = System.currentTimeMillis() - completeIndexingStart;
+            logger.info("Complete indexing time (including bulk, refresh & availability check): " + (completeIndexingTime / 1000.0) + " seconds");
+            response.getBenchmarks().put("CompleteIndexingTime", completeIndexingTime / 1000.0);
 
             response.setSuccess(true);
             long overallTime = System.currentTimeMillis() - overallStart;
