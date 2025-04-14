@@ -18,10 +18,11 @@ import java.util.function.Supplier;
 /**
  * CustomIndexPlugin is a custom Elasticsearch plugin that registers custom REST handlers.
  *
- * <p>This plugin registers two REST handlers:
+ * <p>This plugin registers multiple REST handlers:
  * <ul>
  *   <li>{@link CustomIndexRestHandler} - for handling direct JSON indexing requests.</li>
  *   <li>{@link TxtProcessingRestHandler} - for processing large TXT files.</li>
+ *   <li>{@link CustomIndexRestHandlerManagingVersion} - for managing full plugin-driven indexing flow.</li>
  * </ul>
  *
  * <p>By implementing {@code ActionPlugin}, the plugin is able to extend the REST API functionality
@@ -51,10 +52,11 @@ public class CustomIndexPlugin extends Plugin implements ActionPlugin {
             IndexNameExpressionResolver indexNameExpressionResolver,
             Supplier<DiscoveryNodes> nodesInCluster) {
 
-        // Register two REST handlers: one for direct JSON indexing and one for processing TXT files.
+        // Register REST handlers: direct indexing, TXT processing, and full plugin-managed processing
         return Arrays.asList(
                 new CustomIndexRestHandler(),
-                new TxtProcessingRestHandler()
+                new TxtProcessingRestHandler(),
+                new CustomIndexRestHandlerManagingVersion()
         );
     }
 }
