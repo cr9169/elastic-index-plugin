@@ -1,10 +1,8 @@
 package org.example;
 
 import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.client.internal.node.NodeClient;
-import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.rest.*;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentFactory;
@@ -14,6 +12,9 @@ import org.elasticsearch.xcontent.NamedXContentRegistry;
 import org.elasticsearch.xcontent.DeprecationHandler;
 
 import java.io.*;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -28,7 +29,6 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
     private static final String DOTNET_SERVICE_URL = "http://localhost:5203/process/v3";
     private static final String ELASTIC_URL = "http://localhost:9200";
     private static final AtomicInteger documentCounter = new AtomicInteger(0);
-    private static long startTime;
 
     @Override
     public String getName() {
@@ -44,7 +44,9 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        startTime = System.currentTimeMillis();
+        long overallStart = System.currentTimeMillis();
+        logMemoryUsage("[PLUGIN] Initial memory usage");
+
         String json = request.content().utf8ToString();
         String filePath = extractFilePath(json);
 
@@ -52,16 +54,20 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "Missing or invalid 'path' field"));
         }
 
-        logger.info("[PLUGIN] Received file processing request for: " + filePath);
+        logger.info("[PLUGIN] Received file processing request for path: " + filePath);
+
+        long requestDotnetStart = System.currentTimeMillis();
         List<Map<String, Object>> chunks = requestChunksFromDotnet(filePath);
+        long requestDotnetDuration = System.currentTimeMillis() - requestDotnetStart;
+        logger.info("[PLUGIN] Completed retrieving chunks from .NET service in " + requestDotnetDuration + "ms");
 
         if (chunks == null || chunks.isEmpty()) {
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.INTERNAL_SERVER_ERROR, "Failed to receive chunks from .NET service"));
         }
 
         logger.info("[PLUGIN] Received " + chunks.size() + " chunks from .NET service");
-        long indexingStart = System.currentTimeMillis();
 
+        long indexingStart = System.currentTimeMillis();
         int i = 1;
         for (Map<String, Object> chunk : chunks) {
             IndexRequest indexRequest = new IndexRequest(INDEX_NAME);
@@ -75,13 +81,22 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
 
             documentCounter.incrementAndGet();
         }
+        long indexingDuration = System.currentTimeMillis() - indexingStart;
+        logger.info("[PLUGIN] Indexing stage completed in " + indexingDuration + "ms");
 
-        long indexingTime = System.currentTimeMillis() - indexingStart;
+        long refreshStart = System.currentTimeMillis();
         refreshIndex();
-        int indexedCount = countDocuments();
+        long refreshDuration = System.currentTimeMillis() - refreshStart;
+        logger.info("[PLUGIN] Index refresh completed in " + refreshDuration + "ms");
 
-        long totalTime = System.currentTimeMillis() - startTime;
-        logger.info("[PLUGIN] Indexing completed: " + indexedCount + " documents in " + totalTime + " ms");
+        long countStart = System.currentTimeMillis();
+        int indexedCount = countDocuments();
+        long countDuration = System.currentTimeMillis() - countStart;
+        logger.info("[PLUGIN] Document count verified: " + indexedCount + ". Duration: " + countDuration + "ms");
+
+        long overallDuration = System.currentTimeMillis() - overallStart;
+        logger.info("[PLUGIN] End-to-end processing completed in " + overallDuration + "ms");
+        logMemoryUsage("[PLUGIN] Final memory usage");
 
         return channel -> {
             XContentBuilder builder = XContentFactory.jsonBuilder();
@@ -89,8 +104,11 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
             builder.field("indexing_success", indexedCount == chunks.size());
             builder.field("requested_chunks", chunks.size());
             builder.field("indexed_documents", indexedCount);
-            builder.field("processing_time_ms", totalTime);
-            builder.field("indexing_duration_ms", indexingTime);
+            builder.field("processing_time_ms", overallDuration);
+            builder.field("indexing_duration_ms", indexingDuration);
+            builder.field("dotnet_request_ms", requestDotnetDuration);
+            builder.field("index_refresh_ms", refreshDuration);
+            builder.field("count_documents_ms", countDuration);
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         };
@@ -202,5 +220,14 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
             logger.warning("Failed to count documents: " + e.getMessage());
             return -1;
         }
+    }
+
+    private void logMemoryUsage(String context) {
+        MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+        MemoryUsage heap = memoryBean.getHeapMemoryUsage();
+        long used = heap.getUsed();
+        long max = heap.getMax();
+        double usagePercent = ((double) used / max) * 100.0;
+        logger.info(context + " - Heap used: " + used / (1024 * 1024) + " MB / " + max / (1024 * 1024) + " MB (" + String.format("%.2f", usagePercent) + "%)");
     }
 }
