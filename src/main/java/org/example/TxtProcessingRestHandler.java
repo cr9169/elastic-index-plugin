@@ -1,18 +1,17 @@
 package org.example;
 
 import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;
 import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
+import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.client.internal.node.NodeClient;
+import org.elasticsearch.cluster.health.ClusterHealthStatus;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.rest.BaseRestHandler;
-import org.elasticsearch.rest.BytesRestResponse;
-import org.elasticsearch.rest.RestRequest;
-import org.elasticsearch.rest.RestStatus;
-import org.elasticsearch.rest.RestChannel;
+import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.rest.*;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentFactory;
 import org.elasticsearch.xcontent.XContentType;
@@ -20,6 +19,9 @@ import org.elasticsearch.xcontent.XContentType;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
@@ -32,22 +34,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;
-import org.elasticsearch.cluster.health.ClusterHealthStatus;
-import org.elasticsearch.core.TimeValue;
 
 public class TxtProcessingRestHandler extends BaseRestHandler {
 
-    // Constants (ניתן להחליף בהגדרות חיצוניות)
-    private static final int DEFAULT_CHUNK_SIZE_BYTES = 9 * 1024 * 1024; // 9 MB
+    private static final int DEFAULT_CHUNK_SIZE_BYTES = 9 * 1024 * 1024;
     private static final int MAX_PARALLELISM = 4;
-    private static final int MAX_CONCURRENT_BATCHES = 5; // Increased from 3 to 5
-    private static final int BATCH_SIZE = 30; // Increased from 20 to 30 chunks per batch
-
-    // סף לקבצים גדולים – מעל 50 MB נעשה שימוש בעיבוד מקבילי
-    private static final long LARGE_FILE_THRESHOLD = 50L * 1024 * 1024; // 50 MB
-
-    // ספריה מותרת לעיבוד קבצים
+    private static final int MAX_CONCURRENT_BATCHES = 5;
+    private static final int BATCH_SIZE = 30;
+    private static final long LARGE_FILE_THRESHOLD = 50L * 1024 * 1024;
     private static final String ALLOWED_DIRECTORY = "C:/Users/BarGabay/big files";
     private static final Logger logger = Logger.getLogger(TxtProcessingRestHandler.class.getName());
 
@@ -58,7 +52,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
     @Override
     public List<Route> routes() {
-        // שני נתיבים – הנתיב הרגיל ובנוסף נתיב שמכריח שימוש תמידי בעיבוד סדרתי
         return Arrays.asList(
                 new Route(RestRequest.Method.POST, "/_process_txt"),
                 new Route(RestRequest.Method.POST, "/_process_txt_optimized")
@@ -68,50 +61,41 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         try {
-            // פענוח תוכן הבקשה – מצפים לשדה "path"
             Map<String, Object> sourceAsMap = request.contentParser().map();
             String filePath = (String) sourceAsMap.get("path");
             if (filePath == null) {
                 throw new IllegalArgumentException("Missing 'path' parameter");
             }
 
-            // אימות שהקובץ נמצא בתוך הספריה המותרת
             File requestedFile = new File(filePath);
             File allowedDir = new File(ALLOWED_DIRECTORY);
             if (!requestedFile.getCanonicalPath().startsWith(allowedDir.getCanonicalPath())) {
                 throw new SecurityException("Access denied: File is outside allowed directory");
             }
 
-            // עיבוד הקובץ
             return channel -> {
                 try {
                     String uri = request.getHttpRequest().uri();
                     logger.info("The URI is: " + uri);
 
-                    ProcessingResponse response;
-                    if (uri.contains("_process_txt_optimized")) {
-                        logger.info("Using always-optimized sequential processing for file: " + filePath);
-                        logger.info("Using always-optimized sequential processing for file: " + filePath);
-                        logger.info("Using always-optimized sequential processing for file: " + filePath);
-                        logger.info("Using always-optimized sequential processing for file: " + filePath);
-                        logger.info("Using always-optimized sequential processing for file: " + filePath);
-                        response = processFileOptimized(filePath, client);
-                    } else {
-                        logger.info("Using never-optimized sequential processing for file: " + filePath);
-                        logger.info("Using never-optimized sequential processing for file: " + filePath);
-                        logger.info("Using never-optimized sequential processing for file: " + filePath);
-                        logger.info("Using never-optimized sequential processing for file: " + filePath);
-                        logger.info("Using never-optimized sequential processing for file: " + filePath);
-                        response = processFile(filePath, client);
-                    }
+                    logMemoryUsage("Initial");
+                    long startOverall = System.currentTimeMillis();
 
-                    // בניית תגובת JSON
+                    ProcessingResponse response = uri.contains("_process_txt_optimized")
+                            ? processFileOptimized(filePath, client)
+                            : processFile(filePath, client);
+
+                    long totalDuration = System.currentTimeMillis() - startOverall;
+                    response.getBenchmarks().put("TotalTimeSeconds", totalDuration / 1000.0);
+                    logMemoryUsage("Final");
+
                     XContentBuilder builder = XContentFactory.jsonBuilder();
                     builder.startObject();
                     builder.field("success", response.isSuccess());
                     builder.field("errorMessage", response.getErrorMessage());
                     builder.field("chunkCount", response.getChunkCount());
                     builder.field("processingTimeInSeconds", response.getProcessingTimeInSeconds());
+                    builder.field("benchmarks", response.getBenchmarks());
                     builder.endObject();
                     channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
                 } catch (Exception e) {
@@ -123,6 +107,15 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             logger.log(Level.SEVERE, "Error preparing request", e);
             return channel -> sendErrorResponse(channel, e);
         }
+    }
+
+    private void logMemoryUsage(String phase) {
+        MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+        MemoryUsage heapUsage = memoryBean.getHeapMemoryUsage();
+        long used = heapUsage.getUsed();
+        long max = heapUsage.getMax();
+        double percent = ((double) used / max) * 100.0;
+        logger.info("[MEMORY] " + phase + " - Used: " + used / (1024 * 1024) + "MB / " + max / (1024 * 1024) + "MB (" + String.format("%.2f", percent) + "%)");
     }
 
     private void sendErrorResponse(RestChannel channel, Exception e) throws IOException {
