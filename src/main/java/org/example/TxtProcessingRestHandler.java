@@ -12,6 +12,7 @@ import org.elasticsearch.cluster.health.ClusterHealthStatus;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.rest.*;
+import org.elasticsearch.rest.action.RestResponseListener;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentFactory;
 import org.elasticsearch.xcontent.XContentType;
@@ -75,7 +76,8 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
             return channel -> {
                 try {
-                    String uri = request.getHttpRequest().uri();
+                    // שינוי: שימוש ב-request.uri() במקום getHttpRequest().uri()
+                    String uri = request.uri();
                     logger.info("The URI is: " + uri);
 
                     logMemoryUsage("Initial");
@@ -97,7 +99,8 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                     builder.field("processingTimeInSeconds", response.getProcessingTimeInSeconds());
                     builder.field("benchmarks", response.getBenchmarks());
                     builder.endObject();
-                    channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+                    // שינוי: שימוש ב-RestResponse
+                    channel.sendResponse(new RestResponse(RestStatus.OK, builder));
                 } catch (Exception e) {
                     logger.log(Level.SEVERE, "Error processing file", e);
                     sendErrorResponse(channel, e);
@@ -124,7 +127,8 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         builder.field("success", false);
         builder.field("errorMessage", "Error processing request: " + e.getMessage());
         builder.endObject();
-        channel.sendResponse(new BytesRestResponse(RestStatus.INTERNAL_SERVER_ERROR, builder));
+        // שינוי: שימוש ב-RestResponse לשליחת תגובת שגיאה
+        channel.sendResponse(new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, builder));
     }
 
     /**

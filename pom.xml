@@ -17,19 +17,29 @@
     </properties>
 
     <dependencies>
-        <!-- Main dependency on Elasticsearch -->
+        <!-- תלות עיקרית - מכילה את רוב ה-APIs הנדרשים -->
+        <dependency>
+            <groupId>org.elasticsearch</groupId>
+            <artifactId>elasticsearch</artifactId>
+            <version>${elasticsearch.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- X-content module -->
         <dependency>
             <groupId>org.elasticsearch</groupId>
             <artifactId>elasticsearch-x-content</artifactId>
             <version>${elasticsearch.version}</version>
             <scope>provided</scope>
         </dependency>
+
         <!-- Apache Commons Lang3 -->
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-lang3</artifactId>
             <version>3.17.0</version>
         </dependency>
+
         <dependency>
             <groupId>org.json</groupId>
             <artifactId>json</artifactId>
@@ -38,9 +48,30 @@
     </dependencies>
 
     <repositories>
+        <!-- Main Elastic Repository -->
         <repository>
-            <id>elasticsearch-releases</id>
+            <id>elastic</id>
+            <name>Elastic Repository</name>
             <url>https://artifacts.elastic.co/maven</url>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
+        </repository>
+
+        <!-- Maven Central Repository -->
+        <repository>
+            <id>central</id>
+            <name>Central Repository</name>
+            <url>https://repo.maven.apache.org/maven2</url>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
         </repository>
     </repositories>
 

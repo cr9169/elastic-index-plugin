@@ -7,7 +7,7 @@ import org.elasticsearch.action.index.IndexResponse;
 import org.elasticsearch.client.internal.node.NodeClient;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.rest.BaseRestHandler;
-import org.elasticsearch.rest.BytesRestResponse;
+import org.elasticsearch.rest.RestResponse;
 import org.elasticsearch.rest.RestRequest;
 import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.rest.action.RestToXContentListener;
@@ -35,7 +35,7 @@ public class CustomIndexRestHandler extends BaseRestHandler {
 
     @Override
     public List<Route> routes() {
-        // Registers the endpoint POST /_custom_index
+        // רישום ה-endpoint POST /_custom_index
         return Collections.singletonList(
                 new Route(RestRequest.Method.POST, "/_custom_index")
         );
@@ -43,23 +43,23 @@ public class CustomIndexRestHandler extends BaseRestHandler {
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        // Check if index exists; if not, create it with optimized settings and mapping
+        // בדיקת קיום האינדקס; אם אינו קיים – צור אותו עם הגדרות ומיפוי מותאמים
         if (!indexExists(client, INDEX_NAME)) {
             createOptimizedIndex(client, INDEX_NAME);
-            startTime = System.currentTimeMillis(); // Reset timer when index is created
-            documentCounter.set(0); // Reset counter when index is created
+            startTime = System.currentTimeMillis(); // אתחול טיימר כאשר האינדקס נוצר
+            documentCounter.set(0); // אתחול המונה כאשר האינדקס נוצר
         }
 
-        // Log the start of processing
+        // רישום התחלת העיבוד
         int currentDoc = documentCounter.incrementAndGet();
         long docStartTime = System.currentTimeMillis();
         logger.info("Starting to index document #" + currentDoc + " in " + INDEX_NAME);
 
-        // Create an IndexRequest using the JSON content from the request body
+        // יצירת IndexRequest באמצעות תוכן ה-JSON שנשלח בגוף הבקשה
         IndexRequest indexRequest = new IndexRequest(INDEX_NAME);
         indexRequest.source(request.content(), request.getXContentType());
 
-        // Pass the request to Elasticsearch's indexing mechanism with enhanced response handling
+        // העברת הבקשה למנגנון האינדוקס של Elasticsearch עם טיפול בתגובה משודרג
         return channel -> client.index(indexRequest, ActionListener.wrap(
                 response -> {
                     long processingTime = System.currentTimeMillis() - docStartTime;
@@ -71,11 +71,11 @@ public class CustomIndexRestHandler extends BaseRestHandler {
                             "Total: " + totalProcessed + " docs in " + (totalTime / 1000) + "s (" + docsPerSecond + " docs/sec)");
 
                     try {
-                        // Create an enhanced response with additional indexing stats
+                        // יצירת תגובה משודרגת עם סטטיסטיקות אינדוקס נוספות
                         XContentBuilder builder = XContentFactory.jsonBuilder();
                         builder.startObject();
 
-                        // Include original response data
+                        // הכללת נתוני התגובה המקוריים
                         builder.field("_index", response.getIndex());
                         builder.field("_id", response.getId());
                         builder.field("_version", response.getVersion());
@@ -83,7 +83,7 @@ public class CustomIndexRestHandler extends BaseRestHandler {
                         builder.field("_seq_no", response.getSeqNo());
                         builder.field("_primary_term", response.getPrimaryTerm());
 
-                        // Add custom fields
+                        // הוספת שדות מותאמים אישית
                         builder.field("indexing_success", true);
                         builder.field("processing_time_ms", processingTime);
                         builder.field("document_number", currentDoc);
@@ -92,7 +92,8 @@ public class CustomIndexRestHandler extends BaseRestHandler {
 
                         builder.endObject();
 
-                        channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+                        // שימוש ב-RestResponse במקום BytesRestResponse
+                        channel.sendResponse(new RestResponse(RestStatus.OK, builder));
                     } catch (Exception e) {
                         logger.warning("Error creating enhanced response: " + e.getMessage());
                         new RestToXContentListener<>(channel).onResponse(response);
@@ -106,15 +107,15 @@ public class CustomIndexRestHandler extends BaseRestHandler {
     }
 
     /**
-     * Checks if the specified index exists.
+     * בודק האם האינדקס הנתון קיים.
      *
-     * @param client    the NodeClient instance
-     * @param indexName the name of the index to check
-     * @return true if the index exists, false otherwise
+     * @param client    מופע NodeClient
+     * @param indexName שם האינדקס לבדיקה
+     * @return true אם האינדקס קיים, false אחרת
      */
     private boolean indexExists(NodeClient client, String indexName) {
         try {
-            // Alternative approach using the cluster state API
+            // גישה למצב הקלסטר ובדיקה האם המיפוי כולל את האינדקס
             return client.admin()
                     .cluster()
                     .prepareState()
@@ -130,34 +131,34 @@ public class CustomIndexRestHandler extends BaseRestHandler {
     }
 
     /**
-     * Creates the index with optimized settings and mapping.
+     * יוצר את האינדקס עם הגדרות ומיפוי מותאמים לאופטימיזציה.
      *
-     * @param client    the NodeClient instance
-     * @param indexName the name of the index to create
-     * @throws IOException if an error occurs during index creation
+     * @param client    מופע NodeClient
+     * @param indexName שם האינדקס ליצירה
+     * @throws IOException במקרה של שגיאה ביצירת האינדקס
      */
     private void createOptimizedIndex(NodeClient client, String indexName) throws IOException {
-        // Create a new index with settings optimized for fast indexing
+        // יצירת אינדקס חדש עם הגדרות מותאמות לאינדוקס מהיר
         CreateIndexRequest createRequest = new CreateIndexRequest(indexName);
         createRequest.settings(Settings.builder()
                 .put("index.number_of_shards", 1)
                 .put("index.number_of_replicas", 0)
-                .put("index.refresh_interval", "30s") // Changed from 120s to 30s for faster verification
+                .put("index.refresh_interval", "30s") // שינוי מ-120s ל-30s לאימות מהיר יותר
                 .put("index.translog.durability", "async")
                 .put("index.translog.flush_threshold_size", "4gb")
-                .put("index.translog.sync_interval", "30s") // Changed from 120s to 30s
+                .put("index.translog.sync_interval", "30s") // שינוי מ-120s ל-30s
                 .put("index.merge.scheduler.max_thread_count", 1)
                 .put("index.merge.policy.segments_per_tier", 50)
                 .put("index.merge.policy.max_merged_segment", "5gb")
                 .put("index.indexing.slowlog.threshold.index.warn", "60s")
-                .put("index.indexing.slowlog.threshold.index.info", "30s") // Changed from 60s to 30s
+                .put("index.indexing.slowlog.threshold.index.info", "30s") // שינוי מ-60s ל-30s
                 .build());
 
-        // Create the index first
+        // יצירת האינדקס
         client.admin().indices().create(createRequest).actionGet();
         logger.info("Created optimized index '" + indexName + "'");
 
-        // Then apply mappings separately
+        // החלפת המיפוי בנפרד
         try {
             XContentBuilder mappingBuilder = XContentFactory.jsonBuilder()
                     .startObject()

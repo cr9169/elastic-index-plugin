@@ -50,8 +50,20 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
         String json = request.content().utf8ToString();
         String filePath = extractFilePath(json);
 
+
         if (filePath == null || filePath.isBlank()) {
-            return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "Missing or invalid 'path' field"));
+            return channel -> {
+                try {
+                    XContentBuilder builder = XContentFactory.jsonBuilder();
+                    builder.startObject();
+                    builder.field("error", "Missing or invalid 'path' field");
+                    builder.endObject();
+
+                    channel.sendResponse(new RestResponse(RestStatus.BAD_REQUEST, builder));
+                } catch (IOException e) {
+                    channel.sendResponse(new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, "Error creating response"));
+                }
+            };
         }
 
         logger.info("[PLUGIN] Received file processing request for path: " + filePath);
@@ -62,7 +74,18 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
         logger.info("[PLUGIN] Completed retrieving chunks from .NET service in " + requestDotnetDuration + "ms");
 
         if (chunks == null || chunks.isEmpty()) {
-            return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.INTERNAL_SERVER_ERROR, "Failed to receive chunks from .NET service"));
+            return channel -> {
+                try {
+                    XContentBuilder builder = XContentFactory.jsonBuilder();
+                    builder.startObject();
+                    builder.field("error", "Failed to receive chunks from .NET service");
+                    builder.endObject();
+
+                    channel.sendResponse(new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, builder));
+                } catch (IOException e) {
+                    channel.sendResponse(new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, "Error creating response"));
+                }
+            };
         }
 
         logger.info("[PLUGIN] Received " + chunks.size() + " chunks from .NET service");
@@ -110,7 +133,8 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
             builder.field("index_refresh_ms", refreshDuration);
             builder.field("count_documents_ms", countDuration);
             builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+
+            channel.sendResponse(new RestResponse(RestStatus.OK, builder));
         };
     }
 
