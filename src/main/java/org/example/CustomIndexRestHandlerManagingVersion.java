@@ -22,6 +22,8 @@ import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
+import com.sun.management.OperatingSystemMXBean;
+
 public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
 
     private static final Logger logger = Logger.getLogger(CustomIndexRestHandlerManagingVersion.class.getName());
@@ -44,12 +46,16 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
+        // Initiate overall metrics tracking
         long overallStart = System.currentTimeMillis();
-        logMemoryUsage("[PLUGIN] Initial memory usage");
+        double cpuOverallStart = getProcessCpuLoadPercent();
+        double heapOverallStart = getHeapUsedPercent();
+
+        logger.info(String.format("[CPU] Overall | Phase: Start | Process CPU Load: %.2f%%", cpuOverallStart));
+        logger.info(String.format("[HEAP] Overall | Phase: Start | Heap Used: %.2f%%", heapOverallStart));
 
         String json = request.content().utf8ToString();
         String filePath = extractFilePath(json);
-
 
         if (filePath == null || filePath.isBlank()) {
             return channel -> {
@@ -68,9 +74,29 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
 
         logger.info("[PLUGIN] Received file processing request for path: " + filePath);
 
+        // STEP 1: Request Chunks from .NET Service
+        double cpuDotnetStart = getProcessCpuLoadPercent();
+        double heapDotnetStart = getHeapUsedPercent();
         long requestDotnetStart = System.currentTimeMillis();
+
+        logger.info(String.format("[CPU] Step: Request .NET | Phase: Start | Process CPU Load: %.2f%%", cpuDotnetStart));
+        logger.info(String.format("[HEAP] Step: Request .NET | Phase: Start | Heap Used: %.2f%%", heapDotnetStart));
+
         List<Map<String, Object>> chunks = requestChunksFromDotnet(filePath);
+
+        double cpuDotnetEnd = getProcessCpuLoadPercent();
+        double heapDotnetEnd = getHeapUsedPercent();
         long requestDotnetDuration = System.currentTimeMillis() - requestDotnetStart;
+        double cpuDotnetAvg = (cpuDotnetStart + cpuDotnetEnd) / 2;
+        double heapDotnetAvg = (heapDotnetStart + heapDotnetEnd) / 2;
+
+        logger.info(String.format("[CPU] Step: Request .NET | Phase: End | Process CPU Load: %.2f%%", cpuDotnetEnd));
+        logger.info(String.format("[HEAP] Step: Request .NET | Phase: End | Heap Used: %.2f%%", heapDotnetEnd));
+        logger.info(String.format("[CPU] Step: Request .NET | Phase: Avg | Duration: %.2fs | Avg CPU: %.2f%%",
+                requestDotnetDuration / 1000.0, cpuDotnetAvg));
+        logger.info(String.format("[HEAP] Request .NET | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
+                heapDotnetStart, heapDotnetEnd, heapDotnetAvg));
+
         logger.info("[PLUGIN] Completed retrieving chunks from .NET service in " + requestDotnetDuration + "ms");
 
         if (chunks == null || chunks.isEmpty()) {
@@ -90,7 +116,14 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
 
         logger.info("[PLUGIN] Received " + chunks.size() + " chunks from .NET service");
 
+        // STEP 2: Index Chunks
+        double cpuIndexingStart = getProcessCpuLoadPercent();
+        double heapIndexingStart = getHeapUsedPercent();
         long indexingStart = System.currentTimeMillis();
+
+        logger.info(String.format("[CPU] Step: Indexing | Phase: Start | Process CPU Load: %.2f%%", cpuIndexingStart));
+        logger.info(String.format("[HEAP] Step: Indexing | Phase: Start | Heap Used: %.2f%%", heapIndexingStart));
+
         int i = 1;
         for (Map<String, Object> chunk : chunks) {
             IndexRequest indexRequest = new IndexRequest(INDEX_NAME);
@@ -104,22 +137,86 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
 
             documentCounter.incrementAndGet();
         }
+
+        double cpuIndexingEnd = getProcessCpuLoadPercent();
+        double heapIndexingEnd = getHeapUsedPercent();
         long indexingDuration = System.currentTimeMillis() - indexingStart;
+        double cpuIndexingAvg = (cpuIndexingStart + cpuIndexingEnd) / 2;
+        double heapIndexingAvg = (heapIndexingStart + heapIndexingEnd) / 2;
+
+        logger.info(String.format("[CPU] Step: Indexing | Phase: End | Process CPU Load: %.2f%%", cpuIndexingEnd));
+        logger.info(String.format("[HEAP] Step: Indexing | Phase: End | Heap Used: %.2f%%", heapIndexingEnd));
+        logger.info(String.format("[CPU] Step: Indexing | Phase: Avg | Duration: %.2fs | Avg CPU: %.2f%%",
+                indexingDuration / 1000.0, cpuIndexingAvg));
+        logger.info(String.format("[HEAP] Indexing | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
+                heapIndexingStart, heapIndexingEnd, heapIndexingAvg));
+
         logger.info("[PLUGIN] Indexing stage completed in " + indexingDuration + "ms");
 
+        // STEP 3: Refresh Index
+        double cpuRefreshStart = getProcessCpuLoadPercent();
+        double heapRefreshStart = getHeapUsedPercent();
         long refreshStart = System.currentTimeMillis();
+
+        logger.info(String.format("[CPU] Step: Refresh | Phase: Start | Process CPU Load: %.2f%%", cpuRefreshStart));
+        logger.info(String.format("[HEAP] Step: Refresh | Phase: Start | Heap Used: %.2f%%", heapRefreshStart));
+
         refreshIndex();
+
+        double cpuRefreshEnd = getProcessCpuLoadPercent();
+        double heapRefreshEnd = getHeapUsedPercent();
         long refreshDuration = System.currentTimeMillis() - refreshStart;
+        double cpuRefreshAvg = (cpuRefreshStart + cpuRefreshEnd) / 2;
+        double heapRefreshAvg = (heapRefreshStart + heapRefreshEnd) / 2;
+
+        logger.info(String.format("[CPU] Step: Refresh | Phase: End | Process CPU Load: %.2f%%", cpuRefreshEnd));
+        logger.info(String.format("[HEAP] Step: Refresh | Phase: End | Heap Used: %.2f%%", heapRefreshEnd));
+        logger.info(String.format("[CPU] Step: Refresh | Phase: Avg | Duration: %.2fs | Avg CPU: %.2f%%",
+                refreshDuration / 1000.0, cpuRefreshAvg));
+        logger.info(String.format("[HEAP] Refresh | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
+                heapRefreshStart, heapRefreshEnd, heapRefreshAvg));
+
         logger.info("[PLUGIN] Index refresh completed in " + refreshDuration + "ms");
 
+        // STEP 4: Count Documents
+        double cpuCountStart = getProcessCpuLoadPercent();
+        double heapCountStart = getHeapUsedPercent();
         long countStart = System.currentTimeMillis();
+
+        logger.info(String.format("[CPU] Step: Count | Phase: Start | Process CPU Load: %.2f%%", cpuCountStart));
+        logger.info(String.format("[HEAP] Step: Count | Phase: Start | Heap Used: %.2f%%", heapCountStart));
+
         int indexedCount = countDocuments();
+
+        double cpuCountEnd = getProcessCpuLoadPercent();
+        double heapCountEnd = getHeapUsedPercent();
         long countDuration = System.currentTimeMillis() - countStart;
+        double cpuCountAvg = (cpuCountStart + cpuCountEnd) / 2;
+        double heapCountAvg = (heapCountStart + heapCountEnd) / 2;
+
+        logger.info(String.format("[CPU] Step: Count | Phase: End | Process CPU Load: %.2f%%", cpuCountEnd));
+        logger.info(String.format("[HEAP] Step: Count | Phase: End | Heap Used: %.2f%%", heapCountEnd));
+        logger.info(String.format("[CPU] Step: Count | Phase: Avg | Duration: %.2fs | Avg CPU: %.2f%%",
+                countDuration / 1000.0, cpuCountAvg));
+        logger.info(String.format("[HEAP] Count | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
+                heapCountStart, heapCountEnd, heapCountAvg));
+
         logger.info("[PLUGIN] Document count verified: " + indexedCount + ". Duration: " + countDuration + "ms");
 
+        // Overall metrics calculation
+        double cpuOverallEnd = getProcessCpuLoadPercent();
+        double heapOverallEnd = getHeapUsedPercent();
         long overallDuration = System.currentTimeMillis() - overallStart;
+        double cpuOverallAvg = (cpuOverallStart + cpuOverallEnd) / 2;
+        double heapOverallAvg = (heapOverallStart + heapOverallEnd) / 2;
+
+        logger.info(String.format("[CPU] Overall | Phase: End | Process CPU Load: %.2f%%", cpuOverallEnd));
+        logger.info(String.format("[HEAP] Overall | Phase: End | Heap Used: %.2f%%", heapOverallEnd));
+        logger.info(String.format("[CPU] Overall | Phase: Avg | Avg CPU: %.2f%%", cpuOverallAvg));
+        logger.info(String.format("[HEAP] Overall | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
+                heapOverallStart, heapOverallEnd, heapOverallAvg));
+
         logger.info("[PLUGIN] End-to-end processing completed in " + overallDuration + "ms");
-        logMemoryUsage("[PLUGIN] Final memory usage");
 
         return channel -> {
             XContentBuilder builder = XContentFactory.jsonBuilder();
@@ -132,10 +229,43 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
             builder.field("dotnet_request_ms", requestDotnetDuration);
             builder.field("index_refresh_ms", refreshDuration);
             builder.field("count_documents_ms", countDuration);
+
+            // Add CPU and Heap benchmarks to response
+            builder.startObject("benchmarks");
+            builder.field("dotnet_request_cpu_percent", cpuDotnetAvg);
+            builder.field("dotnet_request_heap_percent", heapDotnetAvg);
+            builder.field("indexing_cpu_percent", cpuIndexingAvg);
+            builder.field("indexing_heap_percent", heapIndexingAvg);
+            builder.field("refresh_cpu_percent", cpuRefreshAvg);
+            builder.field("refresh_heap_percent", heapRefreshAvg);
+            builder.field("count_cpu_percent", cpuCountAvg);
+            builder.field("count_heap_percent", heapCountAvg);
+            builder.field("overall_cpu_percent", cpuOverallAvg);
+            builder.field("overall_heap_percent", heapOverallAvg);
+            builder.endObject();
+
             builder.endObject();
 
             channel.sendResponse(new RestResponse(RestStatus.OK, builder));
         };
+    }
+
+    /**
+     * Gets the current CPU load percentage for the JVM process.
+     */
+    private double getProcessCpuLoadPercent() {
+        OperatingSystemMXBean osBean = (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+        double load = osBean.getProcessCpuLoad();
+        return load >= 0 ? load * 100 : -1;
+    }
+
+    /**
+     * Gets the current heap memory usage percentage.
+     */
+    private double getHeapUsedPercent() {
+        MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+        MemoryUsage heap = memoryBean.getHeapMemoryUsage();
+        return ((double) heap.getUsed() / heap.getMax()) * 100.0;
     }
 
     private String extractFilePath(String json) {
@@ -244,14 +374,5 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
             logger.warning("Failed to count documents: " + e.getMessage());
             return -1;
         }
-    }
-
-    private void logMemoryUsage(String context) {
-        MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
-        MemoryUsage heap = memoryBean.getHeapMemoryUsage();
-        long used = heap.getUsed();
-        long max = heap.getMax();
-        double usagePercent = ((double) used / max) * 100.0;
-        logger.info(context + " - Heap used: " + used / (1024 * 1024) + " MB / " + max / (1024 * 1024) + " MB (" + String.format("%.2f", usagePercent) + "%)");
     }
 }
