@@ -36,6 +36,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import com.sun.management.OperatingSystemMXBean;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
+
 public class TxtProcessingRestHandler extends BaseRestHandler {
 
     private static final int DEFAULT_CHUNK_SIZE_BYTES = 9 * 1024 * 1024;
@@ -80,7 +85,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                     String uri = request.uri();
                     logger.info("The URI is: " + uri);
 
-                    logMemoryUsage("Initial");
                     long startOverall = System.currentTimeMillis();
 
                     ProcessingResponse response = uri.contains("_process_txt_optimized")
@@ -89,7 +93,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
                     long totalDuration = System.currentTimeMillis() - startOverall;
                     response.getBenchmarks().put("TotalTimeSeconds", totalDuration / 1000.0);
-                    logMemoryUsage("Final");
 
                     XContentBuilder builder = XContentFactory.jsonBuilder();
                     builder.startObject();
@@ -112,13 +115,17 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         }
     }
 
-    private void logMemoryUsage(String phase) {
+    private double getHeapUsedPercent() {
         MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
-        MemoryUsage heapUsage = memoryBean.getHeapMemoryUsage();
-        long used = heapUsage.getUsed();
-        long max = heapUsage.getMax();
-        double percent = ((double) used / max) * 100.0;
-        logger.info("[MEMORY] " + phase + " - Used: " + used / (1024 * 1024) + "MB / " + max / (1024 * 1024) + "MB (" + String.format("%.2f", percent) + "%)");
+        MemoryUsage heap = memoryBean.getHeapMemoryUsage();
+        return ((double) heap.getUsed() / heap.getMax()) * 100.0;
+    }
+
+    private double getProcessCpuLoadPercent() {
+        OperatingSystemMXBean osBean =
+                (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+        double load = osBean.getProcessCpuLoad();
+        return load >= 0 ? load * 100 : -1;
     }
 
     private void sendErrorResponse(RestChannel channel, Exception e) throws IOException {
@@ -332,7 +339,12 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         response.setFilePath(filePath);
         response.setSuccess(false);
         response.setBenchmarks(new HashMap<>());
+
         long overallStart = System.currentTimeMillis();
+        double cpuOverallStart = getProcessCpuLoadPercent();
+        double heapOverallStart = getHeapUsedPercent();
+        logger.info(String.format("[CPU] Overall | Phase: Start | Process CPU Load: %.2f%%", cpuOverallStart));
+        logger.info(String.format("[HEAP] Overall | Phase: Start | Heap Used: %.2f%%", heapOverallStart));
 
         try {
             File file = new File(filePath);
@@ -350,18 +362,34 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             String fileId = file.getName().replace(" ", "_") + "_" + fileSize + "_" + file.lastModified();
 
             int chunkSizeInBytes = DEFAULT_CHUNK_SIZE_BYTES;
-            logger.info("Using optimized sequential processing for file: " + filePath);
+
+            // === Step 1: Chunking ===
+            double cpuChunkStart = getProcessCpuLoadPercent();
+            double heapChunkStart = getHeapUsedPercent();
+            long chunkStartTime = System.currentTimeMillis();
+            logger.info(String.format("[CPU] Step: Chunking | Phase: Start | Process CPU Load: %.2f%%", cpuChunkStart));
+            logger.info(String.format("[HEAP] Step: Chunking | Phase: Start | Heap Used: %.2f%%", heapChunkStart));
+
             List<DocumentChunk> chunks = chunkTextFileOptimized(filePath, fileId, chunkSizeInBytes);
             response.setChunkCount(chunks.size());
 
+            double cpuChunkEnd = getProcessCpuLoadPercent();
+            double heapChunkEnd = getHeapUsedPercent();
+            long chunkDuration = System.currentTimeMillis() - chunkStartTime;
+            double cpuChunkAvg = (cpuChunkStart + cpuChunkEnd) / 2;
+            double heapChunkAvg = (heapChunkStart + heapChunkEnd) / 2;
+            logger.info(String.format("[CPU] Step: Chunking | Phase: End | Process CPU Load: %.2f%%", cpuChunkEnd));
+            logger.info(String.format("[HEAP] Step: Chunking | Phase: End | Heap Used: %.2f%%", heapChunkEnd));
+            logger.info(String.format("[CPU] Step: Chunking | Phase: Avg | Duration: %.2fs | Avg CPU: %.2f%%",
+                    chunkDuration / 1000.0, cpuChunkAvg));
+            logger.info(String.format("[HEAP] Chunking | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
+                    heapChunkStart, heapChunkEnd, heapChunkAvg));
+            response.getBenchmarks().put("ChunkingCpuPercent", cpuChunkAvg);
+            response.getBenchmarks().put("ChunkingHeapPercent", heapChunkAvg);
+            response.getBenchmarks().put("ChunkingTimeSec", chunkDuration / 1000.0);
+
             long totalProcessedChars = chunks.stream().mapToLong(c -> c.getContent().length()).sum();
             logger.info("Total processed characters: " + totalProcessedChars + ", Original file size (bytes): " + fileSize);
-
-            // מדידת זמן קריאה ועיבוד (חלוקת הקובץ לצ'אנקים)
-            long processingEnd = System.currentTimeMillis();
-            long processingTime = processingEnd - overallStart;
-            logger.info("Reading and processing (chunking) took: " + (processingTime / 1000.0) + " seconds");
-            response.getBenchmarks().put("ReadingAndProcessingTime", processingTime / 1000.0);
 
             try {
                 prepareOptimizedIndex(client);
@@ -369,18 +397,43 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 logger.warning("Could not optimize index settings: " + e.getMessage());
             }
 
-            // התחלת מדידת זמן האינדוקס הכולל (כולל bulk indexing, refresh ואימות)
-            long completeIndexingStart = System.currentTimeMillis();
+            // === Step 2: Bulk Indexing ===
+            double cpuBulkStart = getProcessCpuLoadPercent();
+            double heapBulkStart = getHeapUsedPercent();
+            long bulkStartTime = System.currentTimeMillis();
+            logger.info(String.format("[CPU] Step: Bulk Indexing | Phase: Start | Process CPU Load: %.2f%%", cpuBulkStart));
+            logger.info(String.format("[HEAP] Step: Bulk Indexing | Phase: Start | Heap Used: %.2f%%", heapBulkStart));
 
-            // Bulk indexing של הצ'אנקים
             CompletableFuture<Boolean> bulkFuture = bulkIndexChunksParallel(chunks, client);
             boolean bulkResult = bulkFuture.get();
+
+            double cpuBulkEnd = getProcessCpuLoadPercent();
+            double heapBulkEnd = getHeapUsedPercent();
+            long bulkDuration = System.currentTimeMillis() - bulkStartTime;
+            double cpuBulkAvg = (cpuBulkStart + cpuBulkEnd) / 2;
+            double heapBulkAvg = (heapBulkStart + heapBulkEnd) / 2;
+            logger.info(String.format("[CPU] Step: Bulk Indexing | Phase: End | Process CPU Load: %.2f%%", cpuBulkEnd));
+            logger.info(String.format("[HEAP] Step: Bulk Indexing | Phase: End | Heap Used: %.2f%%", heapBulkEnd));
+            logger.info(String.format("[CPU] Step: Bulk Indexing | Phase: Avg | Duration: %.2fs | Avg CPU: %.2f%%",
+                    bulkDuration / 1000.0, cpuBulkAvg));
+            logger.info(String.format("[HEAP] Bulk Indexing | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
+                    heapBulkStart, heapBulkEnd, heapBulkAvg));
+            response.getBenchmarks().put("BulkIndexCpuPercent", cpuBulkAvg);
+            response.getBenchmarks().put("BulkIndexHeapPercent", heapBulkAvg);
+            response.getBenchmarks().put("BulkIndexTimeSec", bulkDuration / 1000.0);
+
             if (!bulkResult) {
                 response.setErrorMessage("Bulk indexing failed");
                 return response;
             }
 
-            // רענון האינדקס - מחכה עד שהמסמכים זמינים לחיפוש
+            // === Step 3: Validation (Refresh + Count) ===
+            double cpuValidationStart = getProcessCpuLoadPercent();
+            double heapValidationStart = getHeapUsedPercent();
+            long validationStartTime = System.currentTimeMillis();
+            logger.info(String.format("[CPU] Step: Validation | Phase: Start | Process CPU Load: %.2f%%", cpuValidationStart));
+            logger.info(String.format("[HEAP] Step: Validation | Phase: Start | Heap Used: %.2f%%", heapValidationStart));
+
             try {
                 client.admin().indices().prepareRefresh("target_index").execute().actionGet();
                 logger.info("Index refresh completed for target_index");
@@ -388,7 +441,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 logger.warning("Failed to refresh index: " + e.getMessage());
             }
 
-            // אימות זמינות המסמכים - בדיקת ספירת המסמכים
             try {
                 long docCount = client.prepareSearch("target_index")
                         .setSize(0)
@@ -405,17 +457,39 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 logger.warning("Unable to verify final document count: " + e.getMessage());
             }
 
-            // חישוב זמן האינדוקס הכולל - מהתחלת ה-bulk indexing ועד שהמידע מוכן לחלוטין
-            long completeIndexingTime = System.currentTimeMillis() - completeIndexingStart;
-            logger.info("Complete indexing time (including bulk, refresh & availability check): " + (completeIndexingTime / 1000.0) + " seconds");
-            response.getBenchmarks().put("CompleteIndexingTime", completeIndexingTime / 1000.0);
+            double cpuValidationEnd = getProcessCpuLoadPercent();
+            double heapValidationEnd = getHeapUsedPercent();
+            long validationDuration = System.currentTimeMillis() - validationStartTime;
+            double cpuValidationAvg = (cpuValidationStart + cpuValidationEnd) / 2;
+            double heapValidationAvg = (heapValidationStart + heapValidationEnd) / 2;
+            logger.info(String.format("[CPU] Step: Validation | Phase: End | Process CPU Load: %.2f%%", cpuValidationEnd));
+            logger.info(String.format("[HEAP] Step: Validation | Phase: End | Heap Used: %.2f%%", heapValidationEnd));
+            logger.info(String.format("[CPU] Step: Validation | Phase: Avg | Duration: %.2fs | Avg CPU: %.2f%%",
+                    validationDuration / 1000.0, cpuValidationAvg));
+            logger.info(String.format("[HEAP] Validation | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
+                    heapValidationStart, heapValidationEnd, heapValidationAvg));
+            response.getBenchmarks().put("ValidationCpuPercent", cpuValidationAvg);
+            response.getBenchmarks().put("ValidationHeapPercent", heapValidationAvg);
+            response.getBenchmarks().put("ValidationTimeSec", validationDuration / 1000.0);
+
+            // === Final CPU and Heap Logging ===
+            double cpuOverallEnd = getProcessCpuLoadPercent();
+            double heapOverallEnd = getHeapUsedPercent();
+            double cpuOverallAvg = (cpuOverallStart + cpuOverallEnd) / 2;
+            double heapOverallAvg = (heapOverallStart + heapOverallEnd) / 2;
+            logger.info(String.format("[CPU] Overall | Phase: End | Process CPU Load: %.2f%%", cpuOverallEnd));
+            logger.info(String.format("[HEAP] Overall | Phase: End | Heap Used: %.2f%%", heapOverallEnd));
+            logger.info(String.format("[CPU] Overall | Phase: Avg | Avg CPU: %.2f%%", cpuOverallAvg));
+            logger.info(String.format("[HEAP] Overall | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
+                    heapOverallStart, heapOverallEnd, heapOverallAvg));
+            response.getBenchmarks().put("TotalCpuAvgPercent", cpuOverallAvg);
+            response.getBenchmarks().put("TotalHeapAvgPercent", heapOverallAvg);
 
             response.setSuccess(true);
-            long overallTime = System.currentTimeMillis() - overallStart;
-            response.setProcessingTimeInSeconds(overallTime / 1000.0);
+            response.setProcessingTimeInSeconds((System.currentTimeMillis() - overallStart) / 1000.0);
 
             logger.info("File processing and indexing completed for " + filePath +
-                    ". Total processing time: " + (overallTime / 1000.0) + " seconds" +
+                    ". Total processing time: " + response.getProcessingTimeInSeconds() + " seconds" +
                     ". Total chunks: " + response.getChunkCount() +
                     ". File size: " + response.getFileSizeInBytes() + " bytes");
 
