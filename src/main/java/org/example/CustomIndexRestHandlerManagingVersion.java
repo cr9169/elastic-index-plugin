@@ -28,7 +28,7 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
 
     private static final Logger logger = Logger.getLogger(CustomIndexRestHandlerManagingVersion.class.getName());
     private static final String INDEX_NAME = "target_index";
-    private static final String DOTNET_SERVICE_URL = "http://localhost:5203/process/v3";
+    private static final String DOTNET_SERVICE_URL = "http://localhost:5203/pluginManager/processFile";
     private static final String ELASTIC_URL = "http://localhost:9200";
     private static final AtomicInteger documentCounter = new AtomicInteger(0);
 
@@ -329,7 +329,7 @@ public class CustomIndexRestHandlerManagingVersion extends BaseRestHandler {
                 String fieldName = parser.currentName();
                 parser.nextToken();
 
-                if ("chunks".equals(fieldName)) {
+                if ("Chunks".equals(fieldName)) {
                     if (parser.currentToken() != XContentParser.Token.START_ARRAY) {
                         throw new IllegalStateException("'chunks' should be an array");
                     }
