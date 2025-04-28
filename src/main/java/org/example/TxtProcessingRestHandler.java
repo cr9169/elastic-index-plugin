@@ -43,12 +43,12 @@ import java.lang.management.MemoryUsage;
 
 public class TxtProcessingRestHandler extends BaseRestHandler {
 
-    private static final int DEFAULT_CHUNK_SIZE_BYTES = 9 * 1024 * 1024;
+    private static final int DEFAULT_CHUNK_SIZE_BYTES = 4 * 1024 * 1024;
     private static final int MAX_PARALLELISM = 4;
     private static final int MAX_CONCURRENT_BATCHES = 5;
     private static final int BATCH_SIZE = 30;
     private static final long LARGE_FILE_THRESHOLD = 50L * 1024 * 1024;
-    private static final String ALLOWED_DIRECTORY = "C:/Users/BarGabay/big files";
+//    private static final String ALLOWED_DIRECTORY = "C:/Users/BarGabay/big files";
     private static final Logger logger = Logger.getLogger(TxtProcessingRestHandler.class.getName());
 
     @Override
@@ -74,10 +74,10 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             }
 
             File requestedFile = new File(filePath);
-            File allowedDir = new File(ALLOWED_DIRECTORY);
-            if (!requestedFile.getCanonicalPath().startsWith(allowedDir.getCanonicalPath())) {
-                throw new SecurityException("Access denied: File is outside allowed directory");
-            }
+//            File allowedDir = new File(ALLOWED_DIRECTORY);
+//            if (!requestedFile.getCanonicalPath().startsWith(allowedDir.getCanonicalPath())) {
+//                throw new SecurityException("Access denied: File is outside allowed directory");
+//            }
 
             return channel -> {
                 try {
@@ -404,8 +404,16 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             logger.info(String.format("[CPU] Step: Bulk Indexing | Phase: Start | Process CPU Load: %.2f%%", cpuBulkStart));
             logger.info(String.format("[HEAP] Step: Bulk Indexing | Phase: Start | Heap Used: %.2f%%", heapBulkStart));
 
-            CompletableFuture<Boolean> bulkFuture = bulkIndexChunksParallel(chunks, client);
-            boolean bulkResult = bulkFuture.get();
+            // CompletableFuture<Boolean> bulkFuture = bulkIndexChunksParallel(chunks, client);
+            // boolean bulkResult = bulkFuture.get();
+
+            boolean bulkResult;
+            try {
+                bulkResult = bulkIndexChunksSequential(chunks, client);
+            } catch (IOException e) {
+                logger.severe("Sequential bulk indexing failed: " + e.getMessage());
+                bulkResult = false;
+            }
 
             double cpuBulkEnd = getProcessCpuLoadPercent();
             double heapBulkEnd = getHeapUsedPercent();
@@ -494,10 +502,12 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                     ". File size: " + response.getFileSizeInBytes() + " bytes");
 
             return response;
+        /*
         } catch (InterruptedException | ExecutionException ex) {
             logger.log(Level.SEVERE, "Error processing TXT file", ex);
             response.setErrorMessage("Error processing TXT: " + ex.getMessage());
             return response;
+        */
         } catch (Exception ex) {
             logger.log(Level.SEVERE, "Error processing TXT file", ex);
             response.setErrorMessage("Error processing TXT: " + ex.getMessage());
@@ -551,6 +561,7 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 chunk.setProcessedAt(new Date());
                 chunk.setFileSizeInBytes(fileSize);
                 chunk.setTotalChunks(chunkCount);
+                // list of all the chunks
                 chunks.add(chunk);
             }
 
@@ -851,6 +862,57 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         }
         return future;
     }
+
+    /**
+     * Sends all document chunks in sequential BulkRequests.
+     * Returns true if every batch succeeded, false on the first failure.
+     */
+    private boolean bulkIndexChunksSequential(List<DocumentChunk> chunks, NodeClient client) throws IOException {
+        // Split into batches of BATCH_SIZE
+        List<List<DocumentChunk>> batches = new ArrayList<>();
+        for (int i = 0; i < chunks.size(); i += BATCH_SIZE) {
+            batches.add(chunks.subList(i, Math.min(i + BATCH_SIZE, chunks.size())));
+        }
+        int totalBatches = batches.size();
+
+        for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+            int batchNumber = batchIndex + 1;
+            List<DocumentChunk> batch = batches.get(batchIndex);
+            logger.info("Sequentially processing batch " + batchNumber + "/" + totalBatches + " with " + batch.size() + " chunks");
+
+            // Build the bulk request
+            BulkRequest bulkRequest = new BulkRequest()
+                    .timeout(TimeValue.timeValueMinutes(5));
+
+            for (DocumentChunk chunk : batch) {
+                Map<String, Object> source = new HashMap<>();
+                source.put("content", chunk.getContent());
+                source.put("fileIdentifier", chunk.getFileIdentifier());
+                source.put("fileName", chunk.getFileName());
+                source.put("originalFilePath", chunk.getOriginalFilePath());
+                source.put("sequenceNumber", chunk.getSequenceNumber());
+                source.put("totalChunks", chunk.getTotalChunks());
+                source.put("processedAt", chunk.getProcessedAt());
+                source.put("fileSizeInBytes", chunk.getFileSizeInBytes());
+
+                bulkRequest.add(new IndexRequest("target_index")
+                        .id(chunk.getId())
+                        .source(source, XContentType.JSON));
+            }
+
+            // Execute and wait
+            BulkResponse response = client.bulk(bulkRequest).actionGet();
+            if (response.hasFailures()) {
+                logger.severe("Batch " + batchNumber + " failed: " + response.buildFailureMessage());
+                return false;
+            } else {
+                logger.info("Batch " + batchNumber + " succeeded.");
+            }
+        }
+
+        return true;
+    }
+
 
     /**
      * Processes a single batch of document chunks by creating a BulkRequest and sending it to Elasticsearch.
