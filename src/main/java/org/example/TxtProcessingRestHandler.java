@@ -46,7 +46,7 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
     private static final int DEFAULT_CHUNK_SIZE_BYTES = 4 * 1024 * 1024;
     private static final int MAX_PARALLELISM = 4;
     private static final int MAX_CONCURRENT_BATCHES = 5;
-    private static final int BATCH_SIZE = 30;
+    private static final int BATCH_SIZE = 25;
     private static final long LARGE_FILE_THRESHOLD = 50L * 1024 * 1024;
 //    private static final String ALLOWED_DIRECTORY = "C:/Users/BarGabay/big files";
     private static final Logger logger = Logger.getLogger(TxtProcessingRestHandler.class.getName());
@@ -868,47 +868,149 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
      * Returns true if every batch succeeded, false on the first failure.
      */
     private boolean bulkIndexChunksSequential(List<DocumentChunk> chunks, NodeClient client) throws IOException {
+        logger.info("===== [BULK_SEQ] Starting sequential bulk indexing process for " + chunks.size() + " chunks =====");
+
+        if (chunks == null || chunks.isEmpty()) {
+            logger.warning("[BULK_SEQ] No chunks to process, returning true by default");
+            return true;
+        }
+
         // Split into batches of BATCH_SIZE
+        logger.info("[BULK_SEQ] Dividing " + chunks.size() + " chunks into batches of " + BATCH_SIZE);
         List<List<DocumentChunk>> batches = new ArrayList<>();
         for (int i = 0; i < chunks.size(); i += BATCH_SIZE) {
-            batches.add(chunks.subList(i, Math.min(i + BATCH_SIZE, chunks.size())));
+            int toIndex = Math.min(i + BATCH_SIZE, chunks.size());
+            List<DocumentChunk> batch = chunks.subList(i, toIndex);
+            batches.add(batch);
+            logger.fine("[BULK_SEQ] Created batch " + (batches.size()) + " with " + batch.size() + " chunks (indexes " + i + " to " + (toIndex-1) + ")");
         }
         int totalBatches = batches.size();
+        logger.info("[BULK_SEQ] Created " + totalBatches + " batches in total");
+
+        int successfulBatches = 0;
+        int failedBatches = 0;
+        long totalDocumentsProcessed = 0;
+        long startTimeOverall = System.currentTimeMillis();
 
         for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
             int batchNumber = batchIndex + 1;
             List<DocumentChunk> batch = batches.get(batchIndex);
-            logger.info("Sequentially processing batch " + batchNumber + "/" + totalBatches + " with " + batch.size() + " chunks");
 
-            // Build the bulk request
-            BulkRequest bulkRequest = new BulkRequest()
-                    .timeout(TimeValue.timeValueMinutes(5));
+            logger.info("[BULK_SEQ] Processing batch " + batchNumber + "/" + totalBatches +
+                    " with " + batch.size() + " chunks (Heap: " + String.format("%.2f", getHeapUsedPercent()) + "%)");
+            long batchStartTime = System.currentTimeMillis();
 
-            for (DocumentChunk chunk : batch) {
-                Map<String, Object> source = new HashMap<>();
-                source.put("content", chunk.getContent());
-                source.put("fileIdentifier", chunk.getFileIdentifier());
-                source.put("fileName", chunk.getFileName());
-                source.put("originalFilePath", chunk.getOriginalFilePath());
-                source.put("sequenceNumber", chunk.getSequenceNumber());
-                source.put("totalChunks", chunk.getTotalChunks());
-                source.put("processedAt", chunk.getProcessedAt());
-                source.put("fileSizeInBytes", chunk.getFileSizeInBytes());
+            try {
+                // Build the bulk request
+                logger.info("[BULK_SEQ] Creating bulk request for batch " + batchNumber);
+                BulkRequest bulkRequest = new BulkRequest()
+                        .timeout(TimeValue.timeValueMinutes(5));
 
-                bulkRequest.add(new IndexRequest("target_index")
-                        .id(chunk.getId())
-                        .source(source, XContentType.JSON));
-            }
+                logger.info("[BULK_SEQ] Adding " + batch.size() + " documents to bulk request");
+                for (int i = 0; i < batch.size(); i++) {
+                    DocumentChunk chunk = batch.get(i);
+                    try {
+                        Map<String, Object> source = new HashMap<>();
+                        source.put("content", chunk.getContent());
+                        source.put("fileIdentifier", chunk.getFileIdentifier());
+                        source.put("fileName", chunk.getFileName());
+                        source.put("originalFilePath", chunk.getOriginalFilePath());
+                        source.put("sequenceNumber", chunk.getSequenceNumber());
+                        source.put("totalChunks", chunk.getTotalChunks());
+                        source.put("processedAt", chunk.getProcessedAt());
+                        source.put("fileSizeInBytes", chunk.getFileSizeInBytes());
 
-            // Execute and wait
-            BulkResponse response = client.bulk(bulkRequest).actionGet();
-            if (response.hasFailures()) {
-                logger.severe("Batch " + batchNumber + " failed: " + response.buildFailureMessage());
+                        IndexRequest indexRequest = new IndexRequest("target_index")
+                                .id(chunk.getId())
+                                .source(source, XContentType.JSON);
+
+                        bulkRequest.add(indexRequest);
+
+                        if (i > 0 && i % 10 == 0) {
+                            logger.fine("[BULK_SEQ] Added " + i + "/" + batch.size() + " documents to bulk request");
+                        }
+                    } catch (Exception e) {
+                        logger.severe("[BULK_SEQ] Error creating index request for chunk ID " + chunk.getId() +
+                                " (seq: " + chunk.getSequenceNumber() + "): " + e.getMessage());
+                        throw new IOException("Failed to create index request", e);
+                    }
+                }
+
+                logger.info("[BULK_SEQ] Bulk request created with " + batch.size() +
+                        " actions, estimated size: " + (bulkRequest.estimatedSizeInBytes() / 1024) + " KB");
+
+                // Execute the request
+                logger.info("[BULK_SEQ] Executing bulk request for batch " + batchNumber);
+                long executionStartTime = System.currentTimeMillis();
+
+                try {
+                    BulkResponse response = client.bulk(bulkRequest).actionGet();
+                    long executionTime = System.currentTimeMillis() - executionStartTime;
+
+                    if (response.hasFailures()) {
+                        failedBatches++;
+                        logger.severe("[BULK_SEQ] Batch " + batchNumber + " FAILED after " + executionTime +
+                                "ms. Failure message: " + response.buildFailureMessage());
+
+                        // Log individual item failures
+                        logger.severe("[BULK_SEQ] Detailed failure information:");
+                        response.forEach(itemResponse -> {
+                            if (itemResponse.isFailed()) {
+                                logger.severe("[BULK_SEQ] Item failure: ID=" + itemResponse.getId() +
+                                        ", Error=" + itemResponse.getFailureMessage());
+                            }
+                        });
+
+                        return false;
+                    } else {
+                        successfulBatches++;
+                        totalDocumentsProcessed += batch.size();
+                        long batchTotalTime = System.currentTimeMillis() - batchStartTime;
+
+                        logger.info("[BULK_SEQ] Batch " + batchNumber + " SUCCEEDED in " + batchTotalTime +
+                                "ms (execution: " + executionTime +
+                                "ms, prep: " + (batchTotalTime - executionTime) +
+                                "ms). Items: " + response.getItems().length);
+
+                        // Log response details
+                        logger.fine("[BULK_SEQ] Response details: took=" + response.getTook() +
+                                ", ingestTook=" + response.getIngestTook());
+                    }
+                } catch (Exception e) {
+                    failedBatches++;
+                    logger.severe("[BULK_SEQ] Exception executing bulk request for batch " + batchNumber +
+                            " after " + (System.currentTimeMillis() - executionStartTime) + "ms: " + e.getMessage());
+                    logger.log(Level.SEVERE, "[BULK_SEQ] Exception stacktrace: ", e);
+                    return false;
+                }
+
+            } catch (Exception e) {
+                failedBatches++;
+                logger.severe("[BULK_SEQ] Exception preparing batch " + batchNumber + ": " + e.getMessage());
+                logger.log(Level.SEVERE, "[BULK_SEQ] Exception stacktrace: ", e);
                 return false;
-            } else {
-                logger.info("Batch " + batchNumber + " succeeded.");
             }
+
+            // Log progress after each batch
+            double progressPercent = (batchNumber * 100.0) / totalBatches;
+            double avgTimePerBatch = (System.currentTimeMillis() - startTimeOverall) / (double)batchNumber;
+            double estimatedTimeRemaining = avgTimePerBatch * (totalBatches - batchNumber) / 1000.0;
+
+            logger.info(String.format("[BULK_SEQ] Progress: %.2f%% complete (%d/%d batches, %d docs processed)",
+                    progressPercent, batchNumber, totalBatches, totalDocumentsProcessed));
+            logger.info(String.format("[BULK_SEQ] Estimated time remaining: %.2f seconds", estimatedTimeRemaining));
+
+            // Log resource usage
+            logger.info(String.format("[BULK_SEQ] Current resource usage - Heap: %.2f%%, CPU: %.2f%%",
+                    getHeapUsedPercent(), getProcessCpuLoadPercent()));
         }
+
+        long totalRuntime = System.currentTimeMillis() - startTimeOverall;
+        logger.info(String.format("[BULK_SEQ] ===== Bulk indexing completed in %.2f seconds =====", totalRuntime/1000.0));
+        logger.info(String.format("[BULK_SEQ] Summary: %d successful batches, %d failed batches, %d total documents processed",
+                successfulBatches, failedBatches, totalDocumentsProcessed));
+        logger.info(String.format("[BULK_SEQ] Performance: %.2f documents per second, %.2f batches per second",
+                totalDocumentsProcessed/(totalRuntime/1000.0), totalBatches/(totalRuntime/1000.0)));
 
         return true;
     }
