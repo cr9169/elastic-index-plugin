@@ -35,7 +35,8 @@
 
         private static final Logger logger = Logger.getLogger(CustomIndexRestHandlerManagingVersion.class.getName());
         private static final String INDEX_NAME = "target_index";
-        private static final String DOTNET_SERVICE_URL = "http://127.0.0.1:5203/api/Txt/pluginManager/processFile";
+        // change to pod address
+        private static final String DOTNET_SERVICE_URL = "http://inf-parseit-poc-service.elastic-system.svc.cluster.local:5203/api/Txt/pluginManager/processFile";
         private static final String ELASTIC_URL = "http://localhost:9200";
         private static final AtomicInteger documentCounter = new AtomicInteger(0);
         private static final org.apache.logging.log4j.Logger log = LogManager.getLogger(CustomIndexRestHandlerManagingVersion.class);

@@ -40,6 +40,10 @@ import com.sun.management.OperatingSystemMXBean;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
 import java.lang.management.MemoryUsage;
+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;
+import org.elasticsearch.cluster.health.ClusterHealthStatus;
+import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.index.query.QueryBuilders;
 
 public class TxtProcessingRestHandler extends BaseRestHandler {
 
@@ -427,35 +431,128 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 return response;
             }
 
-            // === Step 3: Validation (Refresh + Count) ===
+            // === Step 3: Validation - בדיקת בריאות האינדקס והבטחת זמינות כל המסמכים ===
             double cpuValidationStart = getProcessCpuLoadPercent();
             double heapValidationStart = getHeapUsedPercent();
             long validationStartTime = System.currentTimeMillis();
             logger.info(String.format("[CPU] Step: Validation | Phase: Start | Process CPU Load: %.2f%%", cpuValidationStart));
             logger.info(String.format("[HEAP] Step: Validation | Phase: Start | Heap Used: %.2f%%", heapValidationStart));
 
+            boolean validationSuccess = true;
+            String validationMessage = "Index validation completed successfully";
+
             try {
-                client.admin().indices().prepareRefresh("target_index").execute().actionGet();
-                logger.info("Index refresh completed for target_index");
+                logger.info("[VALIDATION] Performing full index flush to ensure all data is committed to disk");
+                client.admin().indices().prepareFlush("target_index").execute().actionGet();
+                logger.info("[VALIDATION] Index flush completed successfully");
             } catch (Exception e) {
-                logger.warning("Failed to refresh index: " + e.getMessage());
+                logger.warning("[VALIDATION] Error during index flush: " + e.getMessage());
+            }
+
+            boolean clusterHealthOk = false;
+            try {
+                logger.info("[VALIDATION] Checking cluster health status");
+                ClusterHealthResponse healthResponse = client.admin()
+                        .cluster()
+                        .prepareHealth("target_index")
+                        .setWaitForYellowStatus()  // לפחות YELLOW כדי שהאינדקס יהיה זמין לחיפוש
+                        .setTimeout(TimeValue.timeValueSeconds(30))
+                        .execute()
+                        .actionGet();
+
+                if (healthResponse.getStatus() == ClusterHealthStatus.GREEN) {
+                    logger.info("[VALIDATION] Cluster health is GREEN for target_index. Index is fully ready.");
+                    clusterHealthOk = true;
+                } else if (healthResponse.getStatus() == ClusterHealthStatus.YELLOW) {
+                    logger.info("[VALIDATION] Cluster health is YELLOW for target_index. Index is available for search.");
+                    clusterHealthOk = true;
+                } else {
+                    logger.warning("[VALIDATION] Cluster health check returned RED status. Index may not be fully available.");
+                    validationMessage = "Cluster status is " + healthResponse.getStatus();
+                    validationSuccess = false;
+                }
+            } catch (Exception ex) {
+                logger.warning("[VALIDATION] Error checking cluster health: " + ex.getMessage());
+                validationMessage = "Error checking cluster health: " + ex.getMessage();
+                validationSuccess = false;
+            }
+
+            if (clusterHealthOk) {
+                try {
+                    logger.info("[VALIDATION] Forcing segment merges to complete");
+                    // מחכה לסיום תהליכי מיזוג הסגמנטים
+                    client.admin().indices().prepareForceMerge("target_index")
+                            .setMaxNumSegments(1)  // ממזג לסגמנט אחד לביצועים אופטימליים
+                            .setFlush(true)        // מבצע flush אחרי המיזוג
+                            .execute().actionGet();
+                    logger.info("[VALIDATION] Force merge completed successfully");
+                } catch (Exception e) {
+                    logger.warning("[VALIDATION] Error during force merge: " + e.getMessage());
+                }
             }
 
             try {
-                long docCount = client.prepareSearch("target_index")
-                        .setSize(0)
+                logger.info("[VALIDATION] Performing final index refresh");
+                client.admin().indices().prepareRefresh("target_index").execute().actionGet();
+                logger.info("[VALIDATION] Final index refresh completed");
+            } catch (Exception e) {
+                logger.warning("[VALIDATION] Error during final refresh: " + e.getMessage());
+            }
+
+            int indexedCount = 0;
+            try {
+                logger.info("[VALIDATION] Verifying all documents are searchable");
+                long actualCount = client.prepareSearch("target_index")
+                        .setSize(0) // אין צורך להחזיר תוצאות, רק ספירה
                         .get()
                         .getHits()
                         .getTotalHits()
                         .value;
-                if (docCount == chunks.size()) {
-                    logger.info("All " + chunks.size() + " chunks are available for search in target_index");
+
+                indexedCount = (int) actualCount;
+
+                if (actualCount == chunks.size()) {
+                    logger.info("[VALIDATION] All " + chunks.size() + " documents are available in the index");
                 } else {
-                    logger.warning("Expected " + chunks.size() + " documents, but found " + docCount + " in target_index");
+                    logger.warning("[VALIDATION] Document count mismatch: expected " + chunks.size() +
+                            " but found " + actualCount);
+                    validationMessage = "Document count mismatch: expected " + chunks.size() +
+                            " but found " + actualCount;
+                    validationSuccess = false;
                 }
-            } catch (Exception e) {
-                logger.warning("Unable to verify final document count: " + e.getMessage());
+
+                try {
+                    long searchStart = System.currentTimeMillis();
+                    long hitCount = client.prepareSearch("target_index")
+                            .setQuery(org.elasticsearch.index.query.QueryBuilders.matchAllQuery())
+                            .setSize(0)  // אין צורך להחזיר תוצאות, רק ספירה
+                            .get()
+                            .getHits()
+                            .getTotalHits()
+                            .value;
+
+                    long searchTime = System.currentTimeMillis() - searchStart;
+                    logger.info("[VALIDATION] Search test completed in " + searchTime + "ms with " + hitCount + " hits");
+
+                    if (hitCount != chunks.size()) {
+                        logger.warning("[VALIDATION] Search hit count mismatch: expected " + chunks.size() +
+                                " but got " + hitCount);
+                        validationSuccess = false;
+                    }
+                } catch (Exception e) {
+                    logger.warning("[VALIDATION] Error during search test: " + e.getMessage());
+                    validationSuccess = false;
+                }
+
+            } catch (Exception ex) {
+                logger.warning("[VALIDATION] Error verifying document count: " + ex.getMessage());
+                validationMessage = "Error verifying document count: " + ex.getMessage();
+                validationSuccess = false;
             }
+
+            response.getBenchmarks().put("ValidationSuccess", validationSuccess ? 1.0 : 0.0);
+            response.getBenchmarks().put("ExpectedDocumentCount", (double) chunks.size());
+            response.getBenchmarks().put("ActualDocumentCount", (double) indexedCount);
 
             double cpuValidationEnd = getProcessCpuLoadPercent();
             double heapValidationEnd = getHeapUsedPercent();
