@@ -77,12 +77,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 throw new IllegalArgumentException("Missing 'path' parameter");
             }
 
-            File requestedFile = new File(filePath);
-            File allowedDir = new File(ALLOWED_DIRECTORY);
-            if (!requestedFile.getCanonicalPath().startsWith(allowedDir.getCanonicalPath())) {
-                throw new SecurityException("Access denied: File is outside allowed directory");
-            }
-
             return channel -> {
                 try {
                     // שינוי: שימוש ב-request.uri() במקום getHttpRequest().uri()
@@ -384,12 +378,16 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             double heapChunkAvg = (heapChunkStart + heapChunkEnd) / 2;
             logger.info(String.format("[CPU] Step: Chunking | Phase: End | Process CPU Load: %.2f%%", cpuChunkEnd));
             logger.info(String.format("[HEAP] Step: Chunking | Phase: End | Heap Used: %.2f%%", heapChunkEnd));
+
             logger.info(String.format("[CPU] Step: Chunking | Phase: Avg | Duration: %.2fs | Avg CPU: %.2f%%",
                     chunkDuration / 1000.0, cpuChunkAvg));
+
             logger.info(String.format("[HEAP] Chunking | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
                     heapChunkStart, heapChunkEnd, heapChunkAvg));
             response.getBenchmarks().put("ChunkingCpuPercent", cpuChunkAvg);
             response.getBenchmarks().put("ChunkingHeapPercent", heapChunkAvg);
+
+            // time of processing in seconds including reading.
             response.getBenchmarks().put("ChunkingTimeSec", chunkDuration / 1000.0);
 
             long totalProcessedChars = chunks.stream().mapToLong(c -> c.getContent().length()).sum();
@@ -614,6 +612,10 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         logger.info("Starting optimized file chunking for " + filePath + " into " + chunkCount + " chunks");
         long startTime = System.currentTimeMillis();
 
+        // Exactly the time that takes to read the file from NAS.
+        long totalReadTime = 0;
+        long totalReadBytes = 0;
+
         try (RandomAccessFile raf = new RandomAccessFile(file, "r");
              FileChannel channel = raf.getChannel()) {
 
@@ -624,7 +626,17 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
                 long startPos = (long) i * chunkSizeInBytes;
                 channel.position(startPos);
 
+                long chunkReadStart = System.currentTimeMillis();
                 int bytesRead = channel.read(buffer);
+                long chunkReadEnd = System.currentTimeMillis();
+
+                totalReadTime += (chunkReadEnd - chunkReadStart);
+                totalReadBytes += bytesRead;
+
+                logger.info(String.format("Chunk #%d: Read %d bytes in %d ms (%.2f MB/s)",
+                        i + 1, bytesRead, (chunkReadEnd - chunkReadStart),
+                        bytesRead / ((chunkReadEnd - chunkReadStart) / 1000.0) / (1024 * 1024)));
+
                 buffer.flip();
 
                 byte[] bytes = new byte[bytesRead];
@@ -652,6 +664,19 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             }
 
             long totalTime = System.currentTimeMillis() - startTime;
+
+            double readSpeed = totalReadBytes / (totalReadTime / 1000.0) / (1024 * 1024);
+            double processingOverhead = totalTime - totalReadTime;
+            double readPercentage = (totalReadTime / (double)totalTime) * 100;
+
+            logger.info(String.format("File reading statistics for %s:", file.getName()));
+            logger.info(String.format("Total file size: %.2f MB", fileSize / (1024.0 * 1024)));
+            // Exactly the time that takes to read the file from NAS.
+            logger.info(String.format("Total read time: %.2f seconds", totalReadTime / 1000.0));
+            logger.info(String.format("Average read speed: %.2f MB/s", readSpeed));
+            logger.info(String.format("Read operations took %.2f%% of total processing time (%.2f seconds overhead)",
+                    readPercentage, processingOverhead / 1000.0));
+
             logger.info("Completed file chunking in " + (totalTime / 1000.0) + " seconds");
             return chunks;
         }

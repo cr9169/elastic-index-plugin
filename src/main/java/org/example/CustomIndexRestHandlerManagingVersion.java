@@ -82,7 +82,7 @@
                     channel.sendResponse(new RestResponse(RestStatus.BAD_REQUEST, b));
                 };
             }
-
+            /// ////////////
             logger.info("[PLUGIN] Received file processing request for path: " + filePath);
 
             // ─── Actual processing consumer ───────────────────────────────────────────
@@ -103,6 +103,7 @@
                 double heapDotnetAvg = (heapDotnetStart + heapDotnetEnd) / 2;
                 logger.info(String.format("[CPU] Step: Request .NET | Phase: End | Process CPU Load: %.2f%%", cpuDotnetEnd));
                 logger.info(String.format("[HEAP] Step: Request .NET | Phase: End | Heap Used: %.2f%%", heapDotnetEnd));
+                // time of processing in seconds (from sending request to getting chunks) including reading.
                 logger.info(String.format("[CPU] Step: Request .NET | Phase: Avg | Duration: %.2fs | Avg CPU: %.2f%%",
                         requestDotnetDuration / 1000.0, cpuDotnetAvg));
                 logger.info(String.format("[HEAP] Request .NET | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
@@ -116,6 +117,7 @@
                     channel.sendResponse(new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, b));
                     return;
                 }
+                /// ////////
                 logger.info("[PLUGIN] Received " + chunks.size() + " chunks from .NET service");
 
                 // STEP 2: Index Chunks
