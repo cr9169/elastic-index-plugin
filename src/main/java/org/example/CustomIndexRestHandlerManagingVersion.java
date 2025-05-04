@@ -1,10 +1,8 @@
     package org.example;
 
-    import org.apache.logging.log4j.LogManager;
     import org.elasticsearch.action.ActionListener;
     import org.elasticsearch.action.index.IndexRequest;
     import org.elasticsearch.client.internal.node.NodeClient;
-    import org.elasticsearch.plugins.Plugin;
     import org.elasticsearch.rest.*;
     import org.elasticsearch.xcontent.XContentBuilder;
     import org.elasticsearch.xcontent.XContentFactory;
@@ -15,6 +13,12 @@
     import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;
     import org.elasticsearch.cluster.health.ClusterHealthStatus;
     import org.elasticsearch.core.TimeValue;
+    import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
+    import org.elasticsearch.action.bulk.BulkRequest;
+    import org.elasticsearch.action.bulk.BulkResponse;
+    import org.elasticsearch.common.settings.Settings;
+    import java.util.concurrent.*;
+    import java.util.concurrent.atomic.AtomicBoolean;
 
     import java.io.*;
     import java.lang.management.ManagementFactory;
@@ -35,12 +39,11 @@
 
         private static final Logger logger = Logger.getLogger(CustomIndexRestHandlerManagingVersion.class.getName());
         private static final String INDEX_NAME = "target_index";
-        // change to pod address
         private static final String DOTNET_SERVICE_URL = "http://inf-parseit-poc-service.elastic-system.svc.cluster.local:5203/api/Txt/pluginManager/processFile";
-        private static final String ELASTIC_URL = "http://localhost:9200";
         private static final AtomicInteger documentCounter = new AtomicInteger(0);
-        private static final org.apache.logging.log4j.Logger log = LogManager.getLogger(CustomIndexRestHandlerManagingVersion.class);
-        private NodeClient nodeClient;
+        private static final int BATCH_SIZE = 30;
+        private static final int MAX_CONCURRENT_BATCHES = 5;
+        private static final int MAX_PARALLELISM = 4;
 
         @Override
         public String getName() {
@@ -82,7 +85,6 @@
                     channel.sendResponse(new RestResponse(RestStatus.BAD_REQUEST, b));
                 };
             }
-            /// ////////////
             logger.info("[PLUGIN] Received file processing request for path: " + filePath);
 
             // ─── Actual processing consumer ───────────────────────────────────────────
@@ -117,25 +119,43 @@
                     channel.sendResponse(new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, b));
                     return;
                 }
-                /// ////////
                 logger.info("[PLUGIN] Received " + chunks.size() + " chunks from .NET service");
 
-                // STEP 2: Index Chunks
+                // STEP 2: Prepare the optimized index
+                try {
+                    prepareOptimizedIndex(client);
+                } catch (Exception e) {
+                    logger.warning("[PLUGIN] Could not optimize index settings: " + e.getMessage());
+                }
+
+                // STEP 3: Bulk Indexing - Using parallel bulk indexing
                 double cpuIndexingStart = getProcessCpuLoadPercent();
                 double heapIndexingStart = getHeapUsedPercent();
                 long indexingStart = System.currentTimeMillis();
-                logger.info(String.format("[CPU] Step: Indexing | Phase: Start | Process CPU Load: %.2f%%", cpuIndexingStart));
-                logger.info(String.format("[HEAP] Step: Indexing | Phase: Start | Heap Used: %.2f%%", heapIndexingStart));
+                logger.info(String.format("[CPU] Step: Bulk Indexing | Phase: Start | Process CPU Load: %.2f%%", cpuIndexingStart));
+                logger.info(String.format("[HEAP] Step: Bulk Indexing | Phase: Start | Heap Used: %.2f%%", heapIndexingStart));
 
-                int idx = 1;
-                for (Map<String, Object> chunk : chunks) {
-                    IndexRequest ir = new IndexRequest(INDEX_NAME).source(chunk, XContentType.JSON);
-                    int chunkNum = idx++;
-                    client.index(ir, ActionListener.wrap(
-                            resp -> logger.info("[PLUGIN] Indexed chunk #" + chunkNum + "/" + chunks.size()),
-                            ex   -> logger.warning("[PLUGIN] Failed to index chunk #" + chunkNum + ": " + ex.getMessage())
-                    ));
-                    documentCounter.incrementAndGet();
+                // Use the new parallel bulk indexing method
+                CompletableFuture<Boolean> bulkFuture = bulkIndexChunksParallel(chunks, client);
+                boolean bulkResult;
+                try {
+                    bulkResult = bulkFuture.get(); // Wait for parallel indexing to complete
+                    if (!bulkResult) {
+                        XContentBuilder b = XContentFactory.jsonBuilder()
+                                .startObject()
+                                .field("error", "Bulk indexing failed")
+                                .endObject();
+                        channel.sendResponse(new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, b));
+                        return;
+                    }
+                } catch (Exception e) {
+                    logger.severe("[PLUGIN] Error in bulk indexing process: " + e.getMessage());
+                    XContentBuilder b = XContentFactory.jsonBuilder()
+                            .startObject()
+                            .field("error", "Error in bulk indexing process: " + e.getMessage())
+                            .endObject();
+                    channel.sendResponse(new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, b));
+                    return;
                 }
 
                 double cpuIndexingEnd = getProcessCpuLoadPercent();
@@ -143,11 +163,11 @@
                 long indexingDuration = System.currentTimeMillis() - indexingStart;
                 double cpuIndexingAvg = (cpuIndexingStart + cpuIndexingEnd) / 2;
                 double heapIndexingAvg = (heapIndexingStart + heapIndexingEnd) / 2;
-                logger.info(String.format("[CPU] Step: Indexing | Phase: End | Process CPU Load: %.2f%%", cpuIndexingEnd));
-                logger.info(String.format("[HEAP] Step: Indexing | Phase: End | Heap Used: %.2f%%", heapIndexingEnd));
-                logger.info(String.format("[CPU] Step: Indexing | Phase: Avg | Duration: %.2fs | Avg CPU: %.2f%%",
+                logger.info(String.format("[CPU] Step: Bulk Indexing | Phase: End | Process CPU Load: %.2f%%", cpuIndexingEnd));
+                logger.info(String.format("[HEAP] Step: Bulk Indexing | Phase: End | Heap Used: %.2f%%", heapIndexingEnd));
+                logger.info(String.format("[CPU] Step: Bulk Indexing | Phase: Avg | Duration: %.2fs | Avg CPU: %.2f%%",
                         indexingDuration / 1000.0, cpuIndexingAvg));
-                logger.info(String.format("[HEAP] Indexing | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
+                logger.info(String.format("[HEAP] Bulk Indexing | Start: %.2f%% | End: %.2f%% | Avg: %.2f%%",
                         heapIndexingStart, heapIndexingEnd, heapIndexingAvg));
 
                 // STEP 3: Refresh Index
@@ -366,6 +386,10 @@
                         .field("requested_chunks", chunks.size())
                         .field("indexed_documents", indexedCount)
                         .field("processing_time_ms", overallDuration)
+                        .field("bulk_indexing_method", "parallel")
+                        .field("batch_size", BATCH_SIZE)
+                        .field("max_concurrent_batches", MAX_CONCURRENT_BATCHES)
+                        .field("total_batches", chunks.size() / BATCH_SIZE + (chunks.size() % BATCH_SIZE > 0 ? 1 : 0))
                         .startObject("benchmarks")
                         .field("dotnet_request_ms", requestDotnetDuration)
                         .field("dotnet_request_cpu_percent", cpuDotnetAvg)
@@ -579,32 +603,213 @@
             return chunks;
         }
 
-        private void refreshIndex() {
-            try {
-                URL url = new URL(ELASTIC_URL + "/" + INDEX_NAME + "/_refresh");
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.getResponseCode();
-            } catch (Exception e) {
-                logger.warning("Failed to refresh index: " + e.getMessage());
+        /**
+         * Prepares an optimized Elasticsearch index for bulk loading.
+         * If an index "target_index" exists, it is updated with optimized settings.
+         * Otherwise, a new index is created with optimized settings and mapping.
+         */
+        private void prepareOptimizedIndex(NodeClient client) throws IOException {
+            logger.info("[PLUGIN] Preparing optimized index for bulk loading");
+
+            boolean indexExists = Arrays.asList(client.admin().indices().prepareGetIndex().get().getIndices())
+                    .contains(INDEX_NAME);
+
+            if (indexExists) {
+                // updated settings to existing index.
+                Settings settings = Settings.builder()
+                        .put("index.refresh_interval", "120s")
+                        .put("index.translog.durability", "async")
+                        .put("index.translog.flush_threshold_size", "4gb")
+                        .put("index.translog.sync_interval", "120s")
+                        .build();
+
+                client.admin().indices().prepareUpdateSettings(INDEX_NAME)
+                        .setSettings(settings)
+                        .get();
+
+                logger.info("[PLUGIN] Updated settings for existing index: " + INDEX_NAME);
+            } else {
+                // create index with optimal settings
+                CreateIndexRequest createRequest = new CreateIndexRequest(INDEX_NAME);
+                createRequest.settings(Settings.builder()
+                        .put("index.number_of_shards", 1)
+                        .put("index.number_of_replicas", 0)
+                        .put("index.refresh_interval", "120s")
+                        .put("index.translog.durability", "async")
+                        .put("index.translog.flush_threshold_size", "4gb")
+                        .put("index.translog.sync_interval", "120s")
+                        .put("index.merge.scheduler.max_thread_count", 1)
+                        .put("index.merge.policy.segments_per_tier", 50)
+                        .put("index.merge.policy.max_merged_segment", "5gb")
+                        .put("index.indexing.slowlog.threshold.index.warn", "60s")
+                        .put("index.indexing.slowlog.threshold.index.info", "30s")
+                        .build());
+
+                client.admin().indices().create(createRequest).actionGet();
+                logger.info("[PLUGIN] Created optimized index for bulk loading");
+
+                // field mapping
+                try {
+                    XContentBuilder mappingBuilder = XContentFactory.jsonBuilder()
+                            .startObject()
+                            .startObject("properties")
+                            .startObject("content")
+                            .field("type", "text")
+                            .field("index", true)
+                            .field("doc_values", false)
+                            .field("norms", false)
+                            .endObject()
+                            .startObject("fileIdentifier")
+                            .field("type", "keyword")
+                            .endObject()
+                            .startObject("fileName")
+                            .field("type", "keyword")
+                            .endObject()
+                            .startObject("sequenceNumber")
+                            .field("type", "integer")
+                            .endObject()
+                            .endObject()
+                            .endObject();
+
+                    client.admin().indices().preparePutMapping(INDEX_NAME)
+                            .setSource(mappingBuilder)
+                            .get();
+
+                    logger.info("[PLUGIN] Created optimized mapping for " + INDEX_NAME);
+                } catch (Exception e) {
+                    logger.warning("[PLUGIN] Could not set optimized mapping: " + e.getMessage());
+                }
             }
         }
 
-        private int countDocuments() {
-            try {
-                URL url = new URL(ELASTIC_URL + "/" + INDEX_NAME + "/_count");
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("GET");
-                BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                String line = in.readLine();
-                in.close();
+        /**
+         * Enhanced parallel bulk indexing for improved performance.
+         * Divides document chunks into batches and indexes them in parallel.
+         */
+        private CompletableFuture<Boolean> bulkIndexChunksParallel(List<Map<String, Object>> chunks, NodeClient client) {
+            logger.info("[PLUGIN] Starting parallel bulk indexing process for " + chunks.size() + " chunks");
+            if (chunks == null || chunks.isEmpty()) {
+                CompletableFuture<Boolean> emptyFuture = new CompletableFuture<>();
+                emptyFuture.complete(true);
+                return emptyFuture;
+            }
 
-                int idx = line.indexOf(":");
-                int end = line.indexOf("}");
-                return Integer.parseInt(line.substring(idx + 1, end).trim());
-            } catch (Exception e) {
-                logger.warning("Failed to count documents: " + e.getMessage());
-                return -1;
+            ExecutorService executor = Executors.newFixedThreadPool(MAX_CONCURRENT_BATCHES, r -> {
+                Thread t = new Thread(r);
+                t.setName("bulk-indexer-" + t.getId());
+                t.setPriority(Thread.MAX_PRIORITY);
+                return t;
+            });
+
+            List<List<Map<String, Object>>> batches = new ArrayList<>();
+            for (int i = 0; i < chunks.size(); i += BATCH_SIZE) {
+                batches.add(new ArrayList<>(chunks.subList(i, Math.min(i + BATCH_SIZE, chunks.size()))));
+            }
+
+            CompletableFuture<Boolean> future = new CompletableFuture<>();
+            AtomicInteger completedBatches = new AtomicInteger(0);
+            AtomicBoolean hasFailures = new AtomicBoolean(false);
+            Semaphore semaphore = new Semaphore(MAX_CONCURRENT_BATCHES);
+            int totalBatches = batches.size();
+
+            logger.info("[PLUGIN] Divided into " + totalBatches + " batches, each with up to " +
+                    BATCH_SIZE + " chunks, processing up to " + MAX_CONCURRENT_BATCHES + " batches concurrently");
+
+            for (int i = 0; i < batches.size(); i++) {
+                final int batchIndex = i;
+                final List<Map<String, Object>> batch = batches.get(i);
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        semaphore.acquire();
+                        try {
+                            processBatch(client, batch, batchIndex, totalBatches);
+                        } catch (Exception e) {
+                            logger.severe("[PLUGIN] Error processing batch " + (batchIndex + 1) + ": " + e.getMessage());
+                            hasFailures.set(true);
+                        } finally {
+                            semaphore.release();
+                            if (completedBatches.incrementAndGet() == totalBatches) {
+                                executor.shutdown();
+                                future.complete(!hasFailures.get());
+                                logger.info("[PLUGIN] All " + totalBatches + " batches completed");
+                            }
+                        }
+                    } catch (InterruptedException e) {
+                        logger.severe("[PLUGIN] Batch processing interrupted: " + e.getMessage());
+                        hasFailures.set(true);
+                        if (completedBatches.incrementAndGet() == totalBatches) {
+                            executor.shutdown();
+                            future.complete(false);
+                        }
+                    }
+                }, executor);
+            }
+            return future;
+        }
+
+        /**
+         * Processes a single batch of document chunks by creating a BulkRequest and sending it to Elasticsearch.
+         */
+        private void processBatch(NodeClient client, List<Map<String, Object>> batch, int batchIndex, int totalBatches) throws IOException {
+            int batchNumber = batchIndex + 1;
+            long startTime = System.currentTimeMillis();
+            logger.info("[PLUGIN] Processing batch " + batchNumber + "/" + totalBatches + " with " + batch.size() + " chunks");
+
+            BulkRequest bulkRequest = new BulkRequest();
+            bulkRequest.timeout(org.elasticsearch.core.TimeValue.timeValueMinutes(5));
+
+            for (Map<String, Object> chunk : batch) {
+                // Incrementing the document counter as in the original code
+                documentCounter.incrementAndGet();
+                bulkRequest.add(new IndexRequest(INDEX_NAME).source(chunk, XContentType.JSON));
+            }
+
+            CountDownLatch latch = new CountDownLatch(1);
+            AtomicBoolean success = new AtomicBoolean(true);
+
+            client.bulk(bulkRequest, new ActionListener<BulkResponse>() {
+                @Override
+                public void onResponse(BulkResponse bulkResponse) {
+                    try {
+                        long timeTaken = System.currentTimeMillis() - startTime;
+                        if (bulkResponse.hasFailures()) {
+                            logger.warning("[PLUGIN] Batch " + batchNumber + "/" + totalBatches +
+                                    " completed with failures in " + (timeTaken / 1000.0) + "s: " +
+                                    bulkResponse.buildFailureMessage());
+                            success.set(false);
+                        } else {
+                            logger.info("[PLUGIN] Batch " + batchNumber + "/" + totalBatches +
+                                    " completed successfully in " + (timeTaken / 1000.0) + "s");
+                        }
+                    } finally {
+                        latch.countDown();
+                    }
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    try {
+                        long timeTaken = System.currentTimeMillis() - startTime;
+                        logger.severe("[PLUGIN] Batch " + batchNumber + "/" + totalBatches +
+                                " failed after " + (timeTaken / 1000.0) + "s: " + e.getMessage());
+                        success.set(false);
+                    } finally {
+                        latch.countDown();
+                    }
+                }
+            });
+
+            try {
+                if (!latch.await(10, TimeUnit.MINUTES)) {
+                    logger.severe("[PLUGIN] Batch " + batchNumber + "/" + totalBatches + " timed out after 10 minutes");
+                    throw new IOException("Batch processing timed out");
+                }
+                if (!success.get()) {
+                    throw new IOException("Batch processing failed");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Batch processing was interrupted", e);
             }
         }
     }

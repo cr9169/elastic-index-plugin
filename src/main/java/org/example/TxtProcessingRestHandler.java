@@ -12,7 +12,6 @@ import org.elasticsearch.cluster.health.ClusterHealthStatus;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.rest.*;
-import org.elasticsearch.rest.action.RestResponseListener;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentFactory;
 import org.elasticsearch.xcontent.XContentType;
@@ -37,13 +36,6 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import com.sun.management.OperatingSystemMXBean;
-import java.lang.management.ManagementFactory;
-import java.lang.management.MemoryMXBean;
-import java.lang.management.MemoryUsage;
-import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;
-import org.elasticsearch.cluster.health.ClusterHealthStatus;
-import org.elasticsearch.core.TimeValue;
-import org.elasticsearch.index.query.QueryBuilders;
 
 public class TxtProcessingRestHandler extends BaseRestHandler {
 
@@ -52,7 +44,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
     private static final int MAX_CONCURRENT_BATCHES = 5;
     private static final int BATCH_SIZE = 30;
     private static final long LARGE_FILE_THRESHOLD = 50L * 1024 * 1024;
-    private static final String ALLOWED_DIRECTORY = "C:/Users/BarGabay/big files";
     private static final Logger logger = Logger.getLogger(TxtProcessingRestHandler.class.getName());
 
     @Override
@@ -132,7 +123,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
         builder.field("success", false);
         builder.field("errorMessage", "Error processing request: " + e.getMessage());
         builder.endObject();
-        // שינוי: שימוש ב-RestResponse לשליחת תגובת שגיאה
         channel.sendResponse(new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, builder));
     }
 
@@ -231,7 +221,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
             int chunkSizeInBytes = DEFAULT_CHUNK_SIZE_BYTES;
             List<DocumentChunk> chunks;
-            // בחירה בין שיטת עיבוד על סמך גודל הקובץ
             if (fileSize > LARGE_FILE_THRESHOLD) {
                 logger.info("File size (" + fileSize + " bytes) exceeds threshold (" + LARGE_FILE_THRESHOLD + " bytes). Using parallel processing.");
                 chunks = chunkTextFileParallel(filePath, fileId, chunkSizeInBytes);
@@ -308,7 +297,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
             // 4. חישוב זמן מהסיום של ה-bulk indexing ועד שהנתונים זמינים
             long finalTimeMillis = System.currentTimeMillis() - endOfIndexingMillis;
             logger.info("Time from end of bulk indexing to full availability: " + (finalTimeMillis / 1000.0) + "s");
-            // -------------------------------
 
             response.setSuccess(true);
             long overallTime = System.currentTimeMillis() - overallStart;
@@ -544,7 +532,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
 
             } catch (Exception ex) {
                 logger.warning("[VALIDATION] Error verifying document count: " + ex.getMessage());
-                validationMessage = "Error verifying document count: " + ex.getMessage();
                 validationSuccess = false;
             }
 
@@ -1053,8 +1040,6 @@ public class TxtProcessingRestHandler extends BaseRestHandler {
     private IndexRequest createIndexRequest(String indexName, String id, Map<String, Object> source) {
         return new IndexRequest(indexName).id(id).source(source, XContentType.JSON);
     }
-
-    // Inner classes for the response and chunk models.
 
     /**
      * ProcessingResponse represents the outcome of processing a TXT file.
